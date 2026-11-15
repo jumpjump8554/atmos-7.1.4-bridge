@@ -127,16 +127,19 @@ static int modeSwitchTest()
     return fails;
 }
 
-// Ultra low latency + direct loopback: adaptive margin. Packets of 480 frames every 10 ms (other clock, +40 ppm)
-// arrive with scheduling jitter; the output must never run dry after the first stalls have been learned.
+// Direct loopback input (Low latency = Safe, Ultra low latency+ = Fast): adaptive margin. Packets of 480 frames
+// (or 240 with the short CABLE In period) arrive on another clock (+40 ppm) with scheduling jitter; the output
+// passes (10 ms) wake with their own small jitter. The output must never run dry after the first stalls have
+// been learned.
 struct AdaptResult { uint32_t dropouts, lateDropouts, concealed; double marginEnd, latency; double settleAtStart; };
-static AdaptResult adaptiveRun (double minutes, double pSpike, double spikeLo, double spikeHi, double pBig, double bigLo, double bigHi, unsigned seed)
+static AdaptResult adaptiveRun (double minutes, double pSpike, double spikeLo, double spikeHi, double pBig, double bigLo, double bigHi, unsigned seed,
+                                OutputFeeder::AdaptPolicy policy = OutputFeeder::AdaptPolicy::Safe, int pkt = 480)
 {
-    const int N = 12, pkt = 480, per = 480; const double fs = 48000.0;
+    const int N = 12, per = 480; const double fs = 48000.0;
     OutputFeeder f (N);
     f.producerPrepare (fs, pkt);
-    f.setMode (2);
-    f.setAdaptive (true);
+    f.setMode (policy == OutputFeeder::AdaptPolicy::Fast ? 2 : 1);
+    f.setAdaptive (true, policy);
     f.consumerStart (fs);
     std::vector<std::vector<float>> in (N, std::vector<float> (pkt, 0.1f)), out (N, std::vector<float> (per));
     std::vector<const float*> inP (N); std::vector<float*> outP (N);
@@ -150,6 +153,7 @@ static AdaptResult adaptiveRun (double minutes, double pSpike, double spikeLo, d
     const int64_t base = 1000000;
     AdaptResult r {};
     bool settleRead = false;
+    double latSum = 0.0; long latN = 0;
     while (tc < T)
     {
         // schedule packets up to the consumer time
@@ -164,8 +168,11 @@ static AdaptResult adaptiveRun (double minutes, double pSpike, double spikeLo, d
             prevArrival = a;
             nextNominal += pktT;
         }
+        // output pass wake-up jitter: 0..0.3 ms, sometimes 1..2 ms late
+        double tr = tc + rnd() * 0.3e-3;
+        if (rnd() < 0.001) tr += (1.0 + rnd()) * 1e-3;
         size_t k = 0;
-        for (; k < queue.size() && queue[k].arrive <= tc; ++k)
+        for (; k < queue.size() && queue[k].arrive <= tr; ++k)
         {
             for (int c = 0; c < N; ++c) in[(size_t) c][0] = (float) rnd() * 0.1f;   // real audio is never the same twice
             f.producerReportLateness (queue[k].late);
@@ -173,36 +180,40 @@ static AdaptResult adaptiveRun (double minutes, double pSpike, double spikeLo, d
         }
         queue.erase (queue.begin(), queue.begin() + (long) k);
         const uint32_t before = f.getDropouts();
-        f.render (outP.data(), per, base + (int64_t) (tc * 1e6));
-        if (! settleRead) { r.settleAtStart = f.getSettleRemainingSec (base + (int64_t) (tc * 1e6)); settleRead = true; }
+        f.render (outP.data(), per, base + (int64_t) (tr * 1e6));
+        if (! settleRead) { r.settleAtStart = f.getSettleRemainingSec (base + (int64_t) (tr * 1e6)); settleRead = true; }
         if (f.getDropouts() != before && tc > T - 600.0) ++r.lateDropouts;
+        if (tc > 60.0 && f.getState() == OutputFeeder::State::Running) { latSum += f.getLatencyMs(); ++latN; }
         if (f.getDropouts() != before && std::getenv ("AB_TRACE")) std::printf ("   dropout at %.1f s, margin now %.2f ms\n", tc, f.getMarginMs());
         tc += per / fs;
     }
     r.dropouts = f.getDropouts();
     r.concealed = f.getConcealed();
     r.marginEnd = f.getMarginMs();
-    r.latency = f.getLatencyMs();
+    r.latency = latN > 0 ? latSum / (double) latN : f.getLatencyMs();   // average after the first minute
     return r;
 }
 
 static int adaptiveTest()
 {
+    using P = OutputFeeder::AdaptPolicy;
     int fails = 0;
+    auto line = [&] (const char* name, const AdaptResult& r, bool ok)
     {
-        const auto r = adaptiveRun (30, 0.002, 2, 5, 0.0, 0, 0, 7);
-        const bool ok = r.dropouts == 0 && r.marginEnd < 8.5 && r.settleAtStart > 100.0;
-        std::printf ("adaptive, normal PC 30 min: dropouts=%u margin %.2f ms latency %.1f ms (settle at start %.0f s) %s\n",
-                     r.dropouts, r.marginEnd, r.latency, r.settleAtStart, ok ? "OK" : "FAIL");
+        std::printf ("%-46s dropouts=%u (concealed %u, last 10 min %u) margin %5.2f ms latency %5.1f ms %s\n",
+                     name, r.dropouts, r.concealed, r.lateDropouts, r.marginEnd, r.latency, ok ? "OK" : "FAIL");
         if (! ok) ++fails;
-    }
-    {
-        const auto r = adaptiveRun (30, 0.004, 2, 6, 0.0002, 8, 12, 11);
-        const bool ok = r.lateDropouts == 0 && r.dropouts <= 3 && r.dropouts == r.concealed;
-        std::printf ("adaptive, busy PC 30 min (8-12 ms stalls): dropouts=%u (concealed %u, last 10 min %u) margin %.2f ms latency %.1f ms %s\n",
-                     r.dropouts, r.concealed, r.lateDropouts, r.marginEnd, r.latency, ok ? "OK" : "FAIL");
-        if (! ok) ++fails;
-    }
+    };
+    const auto safeN = adaptiveRun (30, 0.002, 2, 5, 0.0, 0, 0, 7);
+    line ("Low (Safe), normal PC 30 min:", safeN, safeN.dropouts == 0 && safeN.marginEnd < 8.5 && safeN.settleAtStart > 100.0);
+    const auto safeB = adaptiveRun (30, 0.004, 2, 6, 0.0002, 8, 12, 11);
+    line ("Low (Safe), busy PC 30 min (8-12 ms stalls):", safeB, safeB.lateDropouts == 0 && safeB.dropouts <= 3 && safeB.dropouts == safeB.concealed);
+    const auto fastN = adaptiveRun (30, 0.002, 2, 5, 0.0, 0, 0, 7, P::Fast);
+    line ("Ultra+ (Fast), normal PC 30 min:", fastN, fastN.dropouts == 0 && fastN.latency < safeN.latency - 1.0);
+    const auto fastB = adaptiveRun (30, 0.004, 2, 6, 0.0002, 8, 12, 11, P::Fast);
+    line ("Ultra+ (Fast), busy PC 30 min:", fastB, fastB.lateDropouts == 0 && fastB.dropouts <= 3 && fastB.dropouts == fastB.concealed);
+    const auto fast5 = adaptiveRun (30, 0.002, 2, 5, 0.0, 0, 0, 7, P::Fast, 240);
+    line ("Ultra+ (Fast), normal PC, 5 ms packets:", fast5, fast5.dropouts == 0 && fast5.latency < fastN.latency);
     return fails;
 }
 

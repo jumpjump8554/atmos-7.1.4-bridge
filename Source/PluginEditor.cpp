@@ -638,7 +638,14 @@ private:
 
 //==============================================================================
 // Live part of the room: beams and speakers with their neon level.
-class RoomView final : public juce::Component, public juce::SettableTooltipClient
+// v1.4 "dynamic neon": each speaker has
+//   body  - steady loudness (-42..-6 dBFS through a contrast curve), fast attack, ~0.16 s release
+//   punch - hits and accents: the peak jumping above this channel's own recent peak level,
+//           instant attack, ~0.11 s release; it widens the glow, heats the core towards white
+//           (dark themes), surges the ceiling beams and floor reflections and spreads a soft wave of light
+//           outwards from the speaker (no hard ring: a filled glow that widens and fades).
+// The room repaints at 60 Hz on its own timer (the rest of the editor stays at 30 Hz).
+class RoomView final : public juce::Component, public juce::SettableTooltipClient, private juce::Timer
 {
 public:
     RoomView (AtmosBridgeProcessor& p, const UiCtx& c) : proc (p), ctx (c), staticPart (c)
@@ -646,25 +653,95 @@ public:
         addAndMakeVisible (staticPart);
         setComponentID ("room");
         setTooltip (tr ("스피커를 클릭하면 해당 위치로 핑크 노이즈(-20 dBFS)가 나갑니다. 다시 클릭하면 멈춥니다."));
+        lastTickMs = juce::Time::getMillisecondCounterHiRes();
+        startTimerHz (60);
     }
+    ~RoomView() override { stopTimer(); }
 
     void themeChanged() { staticPart.repaint(); repaint(); }
     void resized() override { staticPart.setBounds (getLocalBounds()); }
 
-    void refresh()
+    struct Spread { float age = 10.0f, strength = 0.0f; };
+    struct Neon
     {
+        float body = 0.0f, punch = 0.0f, avgPkDb = -90.0f, lastTarget = 0.0f, sinceSpread = 1.0f, clipHold = 0.0f;
+        std::array<Spread, 3> spreads {};
+        float level() const noexcept { return juce::jmax (body, punch); }
+    };
+
+    static constexpr float kSpreadLife = 0.85f;
+
+    void tick (double dtSec)
+    {
+        const float dt = (float) juce::jlimit (0.001, 0.1, dtSec);
+        const float relBody  = 1.0f - std::exp (-dt / 0.16f);
+        const float relPunch = std::exp (-dt / 0.11f);
         for (int p = 0; p < kNumChannels; ++p)
         {
+            auto& n = neon[(size_t) p];
             const auto m = proc.takePositionMeter (p);
-            const float target = displayLevel (m.rms);
-            level[(size_t) p] = juce::jmax (target, level[(size_t) p] - 0.035f);
-            if (m.peak >= 0.98f) clipHold[(size_t) p] = 12;
-            else if (clipHold[(size_t) p] > 0) --clipHold[(size_t) p];
+            n.clipHold = m.peak >= 0.98f ? 0.4f : juce::jmax (0.0f, n.clipHold - dt);
+
+            const float rmsDb = juce::Decibels::gainToDecibels (m.rms, -100.0f);
+            const float pkDb  = juce::Decibels::gainToDecibels (m.peak, -100.0f);
+
+            float b = juce::jlimit (0.0f, 1.0f, (rmsDb + 42.0f) / 36.0f);
+            b = std::pow (b, 1.7f);
+            n.body = b > n.body ? b : n.body + (b - n.body) * relBody;
+
+            float target = 0.0f;
+            if (pkDb > -70.0f)
+            {
+                const float jump = pkDb - n.avgPkDb;
+                target = juce::jlimit (0.0f, 1.0f, (jump - 3.0f) / 9.0f)
+                       * juce::jlimit (0.0f, 1.0f, (pkDb + 48.0f) / 18.0f);          // no flashes from very quiet signals
+                const float tc = pkDb > n.avgPkDb ? 0.45f : 1.2f;
+                n.avgPkDb += (pkDb - n.avgPkDb) * (1.0f - std::exp (-dt / tc));
+            }
+            else
+                n.avgPkDb = juce::jmax (-90.0f, n.avgPkDb - 20.0f * dt);
+            n.punch = juce::jmax (target, n.punch * relPunch);
+
+            n.sinceSpread += dt;
+            for (auto& w : n.spreads) w.age += dt;
+            if (target > 0.4f && target > n.lastTarget + 0.15f && n.sinceSpread > 0.12f)
+            {
+                auto* oldest = &n.spreads[0];
+                for (auto& w : n.spreads) if (w.age > oldest->age) oldest = &w;
+                *oldest = { 0.0f, target };
+                n.sinceSpread = 0.0f;
+            }
+            n.lastTarget = target;
         }
-        repaint();
+
+        // Repaint only while something is lit or fading, or when what the room shows has changed
+        // (an idle room costs nothing at 60 Hz).
+        bool active = false;
+        for (const auto& n : neon)
+        {
+            if (n.level() > 0.01f || n.clipHold > 0.0f) { active = true; break; }
+            for (const auto& w : n.spreads) if (w.age < kSpreadLife) { active = true; break; }
+            if (active) break;
+        }
+        const int seq = proc.getSequencePosition();
+        int sig = (seq >= 0 ? seq : proc.getPositionNoise()) + 7 * (proc.isBypassed() ? 1 : 0);
+        for (int i = 0; i < kNumChannels; ++i) sig = sig * 31 + proc.getPosition (i);
+        if (active || wasActive || sig != lastSig) repaint();
+        wasActive = active;
+        lastSig = sig;
     }
 
     void paintOverChildren (juce::Graphics& g) override
+    {
+        const double paintStart = juce::Time::getMillisecondCounterHiRes();
+        paintLive (g);
+        // Slow drawing (e.g. a host without GPU drawing): fall back to 30 Hz
+        const double ms = juce::Time::getMillisecondCounterHiRes() - paintStart;
+        paintMsAvg += 0.05 * (ms - paintMsAvg);
+        halfRate = paintMsAvg > (halfRate ? 4.0 : 6.0);
+    }
+
+    void paintLive (juce::Graphics& g)
     {
         const auto& t = ctx.th();
         g.reduceClipRegion (panelShape (getLocalBounds().toFloat().reduced (1.0f), t));
@@ -677,28 +754,61 @@ public:
             if (p >= 0) numbers[p] += (numbers[p].isEmpty() ? "" : ",") + juce::String (i + 1);
         }
 
-        // Ceiling beams (behind the speakers)
+
+        const juce::Colour hot = t.dark ? juce::Colours::white : t.neon;
+
+        // Ceiling beams (behind the speakers): body sets the beam, punch surges and widens it
         for (int p = 0; p < kNumChannels; ++p)
         {
             const auto& s = kGeo[p];
             if (! s.top) continue;
-            const float l = juce::jmin (1.0f, level[(size_t) p] * 1.2f);
+            const auto& n = neon[(size_t) p];
+            const float l = juce::jmin (1.0f, n.body * 1.05f + n.punch * 0.7f);
             if (l <= 0.01f) continue;
+            const float widen = 12.0f * n.punch;
             juce::Path beam;
             beam.startNewSubPath (s.bx + s.bw * 0.42f, s.by);
             beam.lineTo (s.bx + s.bw * 0.58f, s.by);
-            beam.lineTo (s.bx + s.bw, s.by + s.bh);
-            beam.lineTo (s.bx, s.by + s.bh);
+            beam.lineTo (s.bx + s.bw + widen, s.by + s.bh + widen);
+            beam.lineTo (s.bx - widen, s.by + s.bh + widen);
             beam.closeSubPath();
-            juce::ColourGradient grad (t.neon.withAlpha (0.55f * l), s.bx, s.by, t.neon.withAlpha (0.0f), s.bx, s.by + s.bh, false);
-            g.setGradientFill (grad);
+            g.setGradientFill (juce::ColourGradient (t.neon.withAlpha ((t.dark ? 0.5f : 0.42f) * l), s.bx, s.by,
+                                                     t.neon.withAlpha (0.0f), s.bx, s.by + s.bh + widen, false));
             g.fillPath (beam);
+            if (n.punch > 0.05f)
+            {
+                juce::Path core;
+                const float cx = s.bx + s.bw * 0.5f;
+                core.startNewSubPath (cx - s.bw * 0.05f, s.by);
+                core.lineTo (cx + s.bw * 0.05f, s.by);
+                core.lineTo (cx + s.bw * 0.28f, s.by + s.bh * 0.85f);
+                core.lineTo (cx - s.bw * 0.28f, s.by + s.bh * 0.85f);
+                core.closeSubPath();
+                g.setGradientFill (juce::ColourGradient (t.neon.interpolatedWith (hot, 0.5f).withAlpha (0.35f * n.punch), cx, s.by,
+                                                         t.neon.withAlpha (0.0f), cx, s.by + s.bh * 0.85f, false));
+                g.fillPath (core);
+            }
+        }
+
+        // Floor reflections under the ear-level speakers
+        for (int p = 0; p < kNumChannels; ++p)
+        {
+            const auto& s = kGeo[p];
+            if (s.top) continue;
+            const auto& n = neon[(size_t) p];
+            const float a = (t.dark ? 0.22f : 0.16f) * n.body + (t.dark ? 0.32f : 0.22f) * n.punch;
+            if (a <= 0.01f) continue;
+            const float w = s.w * 2.2f + 34.0f * n.punch, h = 16.0f + 10.0f * n.punch;
+            const float cx = s.x + s.w * 0.5f, cy = s.y + s.h + 10.0f;
+            juce::ColourGradient grad (t.neon.withAlpha (juce::jmin (1.0f, a)), cx, cy, t.neon.withAlpha (0.0f), cx + w * 0.5f, cy, true);
+            g.setGradientFill (grad);
+            g.fillEllipse (cx - w * 0.5f, cy - h * 0.5f, w, h);
         }
 
         const int seq = proc.getSequencePosition();
         const int posNoise = seq >= 0 ? seq : proc.getPositionNoise();
         for (int p = 0; p < kNumChannels; ++p)
-            drawSpeaker (g, t, p, level[(size_t) p], clipHold[(size_t) p] > 0, p == posNoise,
+            drawSpeaker (g, t, p, neon[(size_t) p], neon[(size_t) p].clipHold > 0.0f, p == posNoise,
                          numbers[p].isEmpty() ? tr ("\xe2\x80\x93") : numbers[p]);
 
         if (proc.isBypassed())
@@ -768,37 +878,117 @@ private:
         return -1;
     }
 
-    static void drawSpeaker (juce::Graphics& g, const Theme& t, int p, float l, bool clip, bool testing, const juce::String& number)
+    static juce::Path speakerShape (const SpeakerGeo& s, float grow)
+    {
+        juce::Path shape;
+        const juce::Rectangle<float> r (s.x - grow, s.y - grow, s.w + 2.0f * grow, s.h + 2.0f * grow);
+        if (s.ellipse) shape.addEllipse (r);
+        else           shape.addRoundedRectangle (r, s.radius + grow);
+        return shape;
+    }
+
+    // Pre-blurred glow masks (white, single channel) per speaker and blur radius. A glow is drawn by tinting
+    // the two masks around the wanted radius instead of blurring every frame (blurring was ~90 % of the cost).
+    static constexpr std::array<int, 10> kGlowRadii { 3, 5, 8, 12, 17, 23, 30, 38, 47, 57 };
+    struct GlowMask { juce::Image img; juce::Point<int> pos; };
+    std::array<std::array<GlowMask, kGlowRadii.size()>, kNumChannels> glowMasks;
+
+    const GlowMask& glowMask (juce::Graphics& g, int p, int bucket)
+    {
+        auto& m = glowMasks[(size_t) p][(size_t) bucket];
+        if (m.img.isNull())
+        {
+            const int r = kGlowRadii[(size_t) bucket];
+            const auto shape = speakerShape (kGeo[p], 0.0f);
+            const auto area = shape.getBounds().getSmallestIntegerContainer().expanded (r + 1);
+            const auto type = g.getInternalContext().getPreferredImageTypeForTemporaryImages();
+            juce::Image img (juce::Image::SingleChannel, area.getWidth(), area.getHeight(), true, *type);
+            {
+                juce::Graphics g2 (img);
+                g2.setColour (juce::Colours::white);
+                g2.fillPath (shape, juce::AffineTransform::translation ((float) -area.getX(), (float) -area.getY()));
+            }
+            img.getPixelData()->applySingleChannelBoxBlurEffect (r);
+            m = { img, area.getPosition() };
+        }
+        return m;
+    }
+
+    void drawGlow (juce::Graphics& g, int p, float radius, juce::Colour c, juce::Point<int> offset = {})
+    {
+        const auto& R = kGlowRadii;
+        radius = juce::jlimit ((float) R.front(), (float) R.back(), radius);
+        size_t i = 0;
+        while (i + 2 < R.size() && radius > (float) R[i + 1]) ++i;
+        const float t = (radius - (float) R[i]) / (float) (R[i + 1] - R[i]);
+        for (size_t k = 0; k < 2; ++k)
+        {
+            const float w = k == 0 ? 1.0f - t : t;
+            if (w * c.getFloatAlpha() < 0.004f) continue;
+            const auto& m = glowMask (g, p, (int) (i + k));
+            g.setColour (c.withMultipliedAlpha (w));
+            g.drawImageAt (m.img, m.pos.x + offset.x, m.pos.y + offset.y, true);
+        }
+    }
+
+    void drawSpeaker (juce::Graphics& g, const Theme& t, int p, const Neon& n, bool clip, bool testing, const juce::String& number)
     {
         const auto& s = kGeo[p];
         const juce::Rectangle<float> r (s.x, s.y, s.w, s.h);
-        juce::Path shape;
-        if (s.ellipse) shape.addEllipse (r);
-        else           shape.addRoundedRectangle (r, s.radius);
-
-        // Neon: 20 % brighter and larger than v1.1
+        const juce::Path shape = speakerShape (s, 0.0f);
+        const float body = n.body, punch = n.punch, l = n.level();
         const auto glow = clip ? t.clip : t.neon;
+        const auto hot = t.dark ? juce::Colours::white : t.neon;
+
+        // Spread (behind the speaker): a soft filled wave of light that widens and fades.
+        // Ceiling speakers spread flatter (seen in perspective).
+        for (const auto& w : n.spreads)
+        {
+            if (w.age >= kSpreadLife) continue;
+            const float k = w.age / kSpreadLife;
+            const float ease = 1.0f - std::pow (1.0f - k, 3.0f);                 // fast start, slow finish
+            const float a = juce::jmin (1.0f, w.strength * std::pow (1.0f - k, 1.6f) * (t.dark ? 0.72f : 0.55f));
+            if (a <= 0.004f) continue;
+            const float grow = (12.0f + 66.0f * ease) * (0.6f + 0.4f * w.strength);
+            const float rx = s.w * 0.5f + grow;
+            const float ry = s.h * 0.5f + grow * (s.top ? 0.45f : 0.8f);
+            const float cx = r.getCentreX(), cy = r.getCentreY();
+            const auto col = glow.interpolatedWith (hot, t.dark ? 0.3f * (1.0f - k) : 0.0f);
+            juce::ColourGradient grad (col.withAlpha (a), cx, cy, col.withAlpha (0.0f), cx + rx, cy, true);
+            grad.addColour (0.55, col.withAlpha (a * 0.75f));
+            juce::Graphics::ScopedSaveState ss (g);
+            g.addTransform (juce::AffineTransform::scale (1.0f, ry / rx, cx, cy));
+            g.setGradientFill (grad);
+            g.fillEllipse (cx - rx, cy - rx, 2.0f * rx, 2.0f * rx);
+        }
+
+        // Outer glow: size and strength follow the loudness, hits push it further
         if (l > 0.02f)
         {
-            juce::DropShadow (glow.withAlpha (juce::jlimit (0.0f, 1.0f, (0.15f + 0.8f * l) * 1.2f)),
-                              (int) ((4.0f + 26.0f * l) * 1.2f), {}).drawForPath (g, shape);
+            const float a = juce::jlimit (0.0f, 1.0f, 0.12f + 0.72f * body + 0.4f * punch);
+            drawGlow (g, p, 4.0f + 22.0f * body + 30.0f * punch, glow.withAlpha (a));
         }
+        // Inner hot glow on hits (dark themes: white-hot core)
+        if (punch > 0.05f)
+            drawGlow (g, p, 5.0f + 9.0f * punch, glow.interpolatedWith (hot, 0.6f).withAlpha (juce::jmin (1.0f, 0.75f * punch)));
+
         if (! t.dark)
-            juce::DropShadow (C (0xff101828).withAlpha (0.10f), 3, { 0, 1 }).drawForPath (g, shape);
+            drawGlow (g, p, 3.0f, C (0xff101828).withAlpha (0.10f), { 0, 1 });
         g.setColour (t.spkBody);
         g.fillPath (shape);
         if (l > 0.02f)
         {
-            g.setColour (glow.withAlpha (juce::jmin (1.0f, (t.dark ? 0.05f + 0.22f * l : 0.03f + 0.14f * l) * 1.2f)));
+            const float a = t.dark ? 0.05f + 0.24f * body + 0.45f * punch : 0.03f + 0.15f * body + 0.3f * punch;
+            g.setColour (glow.interpolatedWith (hot, t.dark ? 0.55f * punch : 0.0f).withAlpha (juce::jmin (1.0f, a)));
             g.fillPath (shape);
         }
 
         juce::Colour border;
         if (clip)        border = t.clip;
-        else if (t.dark) border = t.neon.withAlpha (juce::jlimit (0.0f, 1.0f, (0.25f + 0.75f * l) * 1.2f));
-        else             border = l > 0.05f ? t.neon.withAlpha (juce::jlimit (0.0f, 1.0f, (0.55f + 0.45f * l) * 1.2f)) : t.spkQuiet;
+        else if (t.dark) border = t.neon.interpolatedWith (hot, 0.6f * punch).withAlpha (juce::jlimit (0.0f, 1.0f, 0.28f + 0.8f * l));
+        else             border = l > 0.05f ? t.neon.withAlpha (juce::jlimit (0.0f, 1.0f, 0.6f + 0.5f * l)) : t.spkQuiet;
         g.setColour (border);
-        g.strokePath (shape, juce::PathStrokeType (testing ? 2.6f : 2.0f));
+        g.strokePath (shape, juce::PathStrokeType ((testing ? 2.6f : 2.0f) + 1.2f * punch));
 
         // Input channel number(s) inside the speaker
         const float fh = s.h < 20.0f ? 13.0f : (s.w >= 40.0f ? 18.0f : 14.0f);
@@ -806,11 +996,11 @@ private:
         g.setFont (monoFont (fh, true));
         if (t.dark && l > 0.05f && ! clip)
         {
-            g.setColour (t.neon.withAlpha (0.35f * l));
+            g.setColour (t.neon.withAlpha (juce::jmin (1.0f, 0.35f * l + 0.3f * punch)));
             for (auto d : { juce::Point<int> (1, 0), juce::Point<int> (-1, 0), juce::Point<int> (0, 1), juce::Point<int> (0, -1) })
                 g.drawText (number, numRect + d, juce::Justification::centred, false);
         }
-        g.setColour (clip ? t.clip : (l > 0.05f ? t.numActive : t.numQuiet));
+        g.setColour (clip ? t.clip : (l > 0.05f ? (t.dark ? t.numActive.interpolatedWith (juce::Colours::white, 0.7f * punch) : t.numActive) : t.numQuiet));
         g.drawText (number, numRect, juce::Justification::centred, false);
 
         // Position code below
@@ -820,12 +1010,52 @@ private:
                     juce::Justification::centred, false);
     }
 
+   #if AB_TEST_HOOKS
+public:
+    inline static bool testManual = false;
+private:
+   #endif
+
+    void timerCallback() override
+    {
+       #if AB_TEST_HOOKS
+        if (testManual) return;
+       #endif
+        if (halfRate && (++frameCount & 1) != 0) return;   // 30 Hz while drawing is slow
+        const double now = juce::Time::getMillisecondCounterHiRes();
+        const double dt = (now - lastTickMs) * 0.001;
+        lastTickMs = now;
+        tick (dt);
+    }
+
     AtmosBridgeProcessor& proc;
     const UiCtx& ctx;
     RoomStatic staticPart;
-    std::array<float, kNumChannels> level {};
-    std::array<int, kNumChannels> clipHold {};
+    std::array<Neon, kNumChannels> neon {};
+    double lastTickMs = 0.0;
+    bool wasActive = true;
+    int lastSig = 0;
+    double paintMsAvg = 0.0;
+    bool halfRate = false;
+    unsigned frameCount = 0;
 };
+
+#if AB_TEST_HOOKS
+namespace abtest
+{
+    void roomManual (bool manual) { RoomView::testManual = manual; }
+    juce::Component* findRoom (juce::Component* c)
+    {
+        if (c->getComponentID() == "room") return c;
+        for (auto* ch : c->getChildren()) if (auto* r = findRoom (ch)) return r;
+        return nullptr;
+    }
+    void roomTick (juce::Component* editor, double dt)
+    {
+        if (auto* r = dynamic_cast<RoomView*> (findRoom (editor))) r->tick (dt);
+    }
+}
+#endif
 
 //==============================================================================
 // Window showing a hosted upmixer's own editor.
@@ -1571,11 +1801,11 @@ public:
         for (int h = 0; h < kMaxUpmixers; ++h)
             proc.getHost (h).beforeUnload = [this, h] { windows[(size_t) h].reset(); };
 
-        static const char* modeNames[kNumModes] = { "기본", "저지연", "초저지연" };
+        static const char* modeNames[kNumModes] = { "기본", "저지연", "초저지연+" };
         static const char* modeTips[kNumModes] = {
-            "기본 모드: 여유 버퍼 100 ms (가장 안정적)",
-            "저지연 모드: 여유 버퍼 8 ms, 끊기면 10 ms씩 자동으로 늘림 (최대 +60 ms)",
-            "초저지연 모드: 직접 루프백(호스트 구간 생략) + 여유 버퍼 자동 보정(끊김 0 우선)"
+            "기본 모드: 호스트 입력, 여유 버퍼 100 ms (가장 안정적)",
+            "저지연 모드: 직접 루프백(호스트 구간 생략) + 여유 버퍼 자동 보정(끊김 0 우선)",
+            "초저지연+ 모드: 직접 루프백 + 타이밍 맞춤 여유 + CABLE In 짧은 주기(드라이버가 지원할 때)"
         };
         for (int m = 0; m < kNumModes; ++m)
         {
@@ -1608,7 +1838,7 @@ public:
         fillDevices();
         addAndMakeVisible (device);
 
-        directBox.setTooltip (tr ("초저지연 입력: 플레이어가 소리를 내보내는 장치(CABLE In 16ch)를 Atmos Bridge가 직접 받아(루프백) "
+        directBox.setTooltip (tr ("저지연 \xc2\xb7 초저지연+ 입력: 플레이어가 소리를 내보내는 장치(CABLE In 16ch)를 Atmos Bridge가 직접 받아(루프백) "
                                   "호스트 구간의 지연을 없앱니다. 문제가 생기면 호스트 입력으로 자동 전환합니다."));
         directBox.beforePopup = [this] { fillDirectSources(); };
         directBox.onChange = [this]
@@ -1709,7 +1939,6 @@ public:
     void refresh()
     {
         const auto& t = ctx.th();
-        room.refresh();
         map.refresh();
         right.refresh();
 
@@ -1781,7 +2010,7 @@ public:
         g.setColour (t.sub); g.setFont (uiFont (15.0f));
         g.drawText (testText, 298, 744, 242, 36, juce::Justification::centredLeft, true);
 
-        // Ultra low latency input state
+        // Direct loopback input state
         g.setColour (directColour.withAlpha (t.dark ? 0.10f : 0.12f)); g.fillRoundedRectangle (kDirectPill, 14);
         g.setColour (directColour.withAlpha (0.45f)); g.drawRoundedRectangle (kDirectPill.reduced (0.5f), 14, 1);
         g.setColour (directColour); g.fillEllipse (kDirectPill.getX() + 12, kDirectPill.getCentreY() - 4, 8, 8);
@@ -1917,13 +2146,11 @@ private:
             rateText = juce::String (outRate / 1000.0, outRate == std::floor (outRate / 1000.0) * 1000.0 ? 0 : 1) + tr (" kHz \xc2\xb7 12ch");
 
             const bool running = st == EngineStatus::Running;
-            static const char* modeNames[kNumModes] = { "기본 모드", "저지연 모드", "초저지연 모드" };
             const int mode = (int) proc.getMode();
             const double margin = s->feeder.getMarginMs();
             const double upLat = proc.getUpmixerLatencyMs();
-            juce::ignoreUnused (modeNames);
             const auto ds = proc.getDirectStatus();
-            const bool direct = mode == (int) LatencyMode::Ultra
+            const bool direct = mode != (int) LatencyMode::Music
                                 && (ds.state == AtmosBridgeProcessor::DirectStatus::Settling || ds.state == AtmosBridgeProcessor::DirectStatus::Running);
             if (direct)
                 modeText = tr ("여유 ") + juce::String (ds.marginMs, 1) + tr (" ms (자동) \xc2\xb7 지연 ")
@@ -1945,12 +2172,12 @@ private:
             else                                    { clockColour = t.ok;    clockText = tr ("클럭: 호스트와 동기 정상"); }
         }
 
-        // Ultra low latency input pill
+        // Direct loopback input pill
         {
             const auto ds = proc.getDirectStatus();
-            const bool ultra = proc.getMode() == LatencyMode::Ultra;
+            const bool directMode = proc.getMode() != LatencyMode::Music;
             using DS = AtmosBridgeProcessor::DirectStatus;
-            if (! ultra)                                    { directColour = t.sub;   directText = tr ("호스트 입력 (기본/저지연)"); }
+            if (! directMode)                               { directColour = t.sub;   directText = tr ("호스트 입력 (기본)"); }
             else if (proc.getDirectSourceId() == "host")    { directColour = t.sub;   directText = tr ("호스트 입력 (직접 끔)"); }
             else if (ds.state == DS::Settling)
             {
@@ -1958,7 +2185,13 @@ private:
                 directColour = t.amber;
                 directText = tr ("안정화 중 ") + juce::String (sec / 60) + ":" + juce::String (sec % 60).paddedLeft ('0', 2);
             }
-            else if (ds.state == DS::Running)               { directColour = t.ok;    directText = tr ("직접 루프백 동작 중"); }
+            else if (ds.state == DS::Running)
+            {
+                directColour = t.ok;
+                directText = proc.getMode() == LatencyMode::Ultra && ds.shortPeriod
+                                 ? tr ("직접 루프백 \xc2\xb7 ") + juce::String (ds.packetMs, ds.packetMs == std::floor (ds.packetMs) ? 0 : 1) + tr (" ms 주기")
+                                 : tr ("직접 루프백 동작 중");
+            }
             else if (ds.state == DS::Fallback)              { directColour = t.amber; directText = tr ("호스트 입력으로 대체 중"); }
             else                                            { directColour = t.sub;   directText = tr ("직접 루프백 대기"); }
         }
@@ -1987,10 +2220,16 @@ private:
         if (tip != lastTip) { lastTip = tip; statusTip.setTooltip (tip); }
         {
             const auto ds = proc.getDirectStatus();
-            juce::String tipText = tr ("초저지연에서는 플레이어 소리를 Atmos Bridge가 직접 받아 호스트 구간의 지연을 없앱니다.\n"
-                                       "처음 2분은 넉넉한 여유로 이 PC의 흔들림을 재고, 끊기지 않는 만큼으로 줄입니다.\n"
-                                       "문제가 생기면 호스트 입력으로 자동 전환합니다.");
+            const bool ultraPlus = proc.getMode() == LatencyMode::Ultra;
+            juce::String tipText = tr ("저지연 \xc2\xb7 초저지연+에서는 플레이어 소리를 Atmos Bridge가 직접 받아 호스트 구간의 지연을 없앱니다.\n"
+                                       "처음 2분은 넉넉한 여유로 이 PC의 흔들림을 재고, 끊기지 않는 만큼으로 줄입니다.\n");
+            if (ultraPlus)
+                tipText << tr ("초저지연+는 패킷 도착과 Atmos 출력의 타이밍 차이까지 계산해 여유를 더 줄입니다.\n");
+            tipText << tr ("문제가 생기면 호스트 입력으로 자동 전환합니다.");
             if (ds.source.isNotEmpty()) tipText << tr ("\n입력 장치: ") << ds.source;
+            if (ultraPlus && ds.packetMs > 0.0)
+                tipText << tr ("\nCABLE In 주기: ") << juce::String (ds.packetMs, ds.packetMs == std::floor (ds.packetMs) ? 0 : 1) << " ms"
+                        << (ds.shortPeriod ? tr (" (짧은 주기 적용됨)") : ds.periodNote.isNotEmpty() ? tr (" (") + ds.periodNote + ")" : juce::String());
             if (ds.state == AtmosBridgeProcessor::DirectStatus::Fallback && ds.reason.isNotEmpty()) tipText << tr ("\n지금 호스트 입력을 쓰는 이유: ") << ds.reason;
             if (tipText != lastDirectTip) { lastDirectTip = tipText; directTip.setTooltip (tipText); }
         }

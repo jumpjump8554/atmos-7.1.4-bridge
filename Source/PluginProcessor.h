@@ -89,14 +89,17 @@ public:
     Meter takeInputMeter (int input) noexcept;
     Meter takePositionMeter (int position) noexcept;
 
-    // Ultra low latency input: direct WASAPI loopback of the device the player plays to (CABLE In 16ch),
-    // instead of the host's own capture. Self-tuning margin; falls back to the host input on any problem.
+    // Low latency / Ultra low latency+ input: direct WASAPI loopback of the device the player plays to
+    // (CABLE In 16ch), instead of the host's own capture. Self-tuning margin (Low: Safe policy, Ultra+:
+    // phase-aware policy + short CABLE In period); falls back to the host input on any problem.
     struct DirectStatus
     {
         enum State { Off = 0, Settling, Running, Fallback };
         int state = Off;
         double marginMs = 0.0, latencyMs = 0.0, settleSec = 0.0;
-        juce::String source, reason;
+        double packetMs = 0.0;        // loopback packet period (Ultra+: 5 ms if the short engine period took effect)
+        bool shortPeriod = false;     // Ultra+: CABLE In runs at the short engine period
+        juce::String source, reason, periodNote;
     };
     DirectStatus getDirectStatus() const { const juce::ScopedLock sl (directLock); return directStatus; }
     void setDirectStatus (const DirectStatus& st) { const juce::ScopedLock sl (directLock); directStatus = st; }
@@ -169,7 +172,7 @@ private:
     void processSource (const float* const* src, int numSrc, int num); // BYPASS ramp + processChunk / silence
     void pushSilence (int num);
 
-    // Ultra low latency input (direct loopback)
+    // Direct loopback input (Low latency / Ultra low latency+)
     void onDirectPacket (const float* interleaved, int frames, int channels, double lateMs, bool silent);
     void updateDirect();                                           // message thread, every timer tick
     void activateDirect();
@@ -259,11 +262,15 @@ private:
     juce::String startedSource { "?" }, directReason;
     juce::uint32 directRetryAtMs = 0;
     int silentStrikes = 0, silentTick = 0;
+    bool startedShort = false;          // loopback started with the short engine period request (Ultra+)
+    int directPacketFrames = 0;         // packet length the feeder was prepared for
+    int activePolicy = -1;              // OutputFeeder::AdaptPolicy of the active direct path
 
 public:
    #if AB_TEST_HOOKS
     // Linux test harness only: drive the direct path without a Windows loopback device.
     bool testNoAutoDirect = false;
+    int testHostToJuce (int i) const { return hostToJuce[(size_t) i].load(); }
     void testSetDirect (bool on) { testNoAutoDirect = true; if (on) activateDirect(); else deactivateDirect ("test", 0); }
     void testDirectPacket (const float* inter, int frames, int ch, double lateMs) { onDirectPacket (inter, frames, ch, lateMs, false); }
     bool testIsDirectActive() const noexcept { return directActive.load(); }

@@ -51,7 +51,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AtmosBridgeProcessor::create
 
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         ParameterID { "mode", 1 }, "Latency Mode",
-        juce::StringArray { "Default", "Low latency", "Ultra low latency" }, 0));
+        juce::StringArray { "Default", "Low latency", "Ultra low latency+" }, 0));
     layout.add (std::make_unique<juce::AudioParameterBool> (ParameterID { "limiter", 2 }, "Clipping Prevention", true));
     layout.add (std::make_unique<juce::AudioParameterBool> (ParameterID { "bypass", 3 }, "Bypass", false));
     return layout;
@@ -153,16 +153,17 @@ void AtmosBridgeProcessor::timerCallback()
         if (++statTick % 50 != 0) return;
         const auto pushes = s->feeder.takePushCount();
         if (pushes == 0 && ! s->feeder.isProducerAlive()) return;
-        char line[400];
+        char line[512];
         std::snprintf (line, sizeof (line),
                        "stats/5s: blocks=%u host=%.0f Hz/%d mode=%d margin=%.0f ms fill=%.1f ms lat=%.1f ms drift=%+.0f ppm "
-                       "drop=%u resync=%u ovf=%u dup=%u bursty=%d engine=%s period=%d memlock=%d direct=%d jit=%.1f ms conceal=%u",
+                       "drop=%u resync=%u ovf=%u dup=%u bursty=%d engine=%s period=%d memlock=%d direct=%d jit=%.1f ms conceal=%u pkt=%d short=%d",
                        pushes, s->feeder.getHostRate(), s->feeder.getHostBlock(), s->feeder.getMode(),
                        s->feeder.getMarginMs(), s->feeder.getFillMs(), (double) s->feeder.getLatencyMs(),
                        (double) s->feeder.getDriftPpm(), s->feeder.getDropouts(), s->feeder.getResyncs(),
                        s->feeder.getOverflows(), s->feeder.getDuplicates(), s->feeder.isProducerBursty() ? 1 : 0,
                        toString (s->engine.getStatus()), s->engine.getPeriodFrames(), s->engine.isMemoryLocked() ? 1 : 0,
-                       directActive.load() ? 1 : 0, s->feeder.getMaxJitterMs(), s->feeder.getConcealed());
+                       directActive.load() ? 1 : 0, s->feeder.getMaxJitterMs(), s->feeder.getConcealed(),
+                       loopback ? loopback->getPacketFrames() : 0, loopback && loopback->isShortPeriodActive() ? 1 : 0);
         logLine (line);
     }
 }
@@ -197,7 +198,8 @@ void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     seqSamples = 0.0;
 
     if (auto* s = getSharedOutput())
-        s->feeder.producerPrepare (currentSampleRate, directActive.load() ? juce::roundToInt (currentSampleRate / 100.0)
+        s->feeder.producerPrepare (currentSampleRate, directActive.load() ? (directPacketFrames > 0 ? directPacketFrames
+                                                                                                    : juce::roundToInt (currentSampleRate / 100.0))
                                                                           : currentBlockSize);
     prepared = true;
 
@@ -252,7 +254,7 @@ void AtmosBridgeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
 
     if (directActive.load (std::memory_order_acquire))
     {
-        // Ultra low latency: the Atmos side runs on the loopback thread. Here only the host input level
+        // Direct loopback (Low / Ultra+): the Atmos side runs on the loopback thread. Here only the host input level
         // is taken (to notice a loopback that stays silent while the host hears sound).
         float pk = 0.0f;
         for (int c = 0; c < juce::jmin (2, numIn); ++c) pk = juce::jmax (pk, buffer.getMagnitude (c, 0, total));
@@ -340,15 +342,21 @@ void AtmosBridgeProcessor::activateDirect()
 {
     auto* s = getSharedOutput();
     if (s == nullptr) return;
+    const auto policy = getMode() == LatencyMode::Ultra ? OutputFeeder::AdaptPolicy::Fast : OutputFeeder::AdaptPolicy::Safe;
+    const int seen = loopback ? loopback->getPacketFrames() : 0;
+    const int pkt = seen > 0 ? seen : juce::roundToInt (currentSampleRate / 100.0);
     {
         const juce::SpinLock::ScopedLockType sl (procLock); // waits for a host block in progress
-        s->feeder.producerPrepare (currentSampleRate, juce::roundToInt (currentSampleRate / 100.0));
-        s->feeder.setAdaptive (true);
+        s->feeder.producerPrepare (currentSampleRate, pkt);
+        s->feeder.setAdaptive (true, policy);
+        directPacketFrames = pkt;
+        activePolicy = (int) policy;
         directActive.store (true, std::memory_order_release);
     }
     silentStrikes = 0;
     directReason.clear();
-    logLine ("Ultra low latency: direct loopback ON (" + (loopback ? loopback->getDeviceName() : std::string()) + ")");
+    logLine (std::string ("Direct loopback ON (") + (policy == OutputFeeder::AdaptPolicy::Fast ? "Ultra low latency+" : "Low latency")
+             + ", packet " + std::to_string (pkt) + " frames, " + (loopback ? loopback->getDeviceName() : std::string()) + ")");
 }
 
 void AtmosBridgeProcessor::deactivateDirect (const juce::String& reason, int retryMs)
@@ -364,19 +372,23 @@ void AtmosBridgeProcessor::deactivateDirect (const juce::String& reason, int ret
         }
     }
     directRetryAtMs = juce::Time::getMillisecondCounter() + (juce::uint32) juce::jmax (0, retryMs);
-    if (was) logLine ("Ultra low latency: direct loopback OFF -> host input (" + reason.toStdString() + ")");
+    activePolicy = -1;
+    if (was) logLine ("Direct loopback OFF -> host input (" + reason.toStdString() + ")");
 }
 
 void AtmosBridgeProcessor::updateDirect()
 {
     using DS = DirectStatus;
     auto* s = getSharedOutput();
-    const bool want = s != nullptr && prepared && getMode() == LatencyMode::Ultra && directSourceId != "host";
+    const auto mode = getMode();
+    const bool want = s != nullptr && prepared && mode != LatencyMode::Music && directSourceId != "host";
+    const bool wantShort = mode == LatencyMode::Ultra;
+    const auto policy = wantShort ? OutputFeeder::AdaptPolicy::Fast : OutputFeeder::AdaptPolicy::Safe;
 
     DirectStatus st;
     if (! want)
     {
-        if (directActive.load()) deactivateDirect ("not in ultra low latency mode", 0);
+        if (directActive.load()) deactivateDirect ("mode without direct loopback", 0);
         if (loopback && loopback->isStarted()) { loopback->stop(); logLine ("Direct loopback stopped"); }
         startedSource = "?";
         directReason.clear();
@@ -385,12 +397,14 @@ void AtmosBridgeProcessor::updateDirect()
     }
 
     if (loopback == nullptr) loopback = std::make_unique<LoopbackCapture>();
-    if (! loopback->isStarted() || startedSource != directSourceId)
+    if (! loopback->isStarted() || startedSource != directSourceId || startedShort != wantShort)
     {
-        if (directActive.load()) deactivateDirect ("input device changed", 0);
+        if (directActive.load()) deactivateDirect (startedShort != wantShort ? "latency mode changed" : "input device changed", 0);
         loopback->start (directSourceId.toStdString(), s->engine.getDeviceName(),
-                         [this] (const float* d, int f, int c, double late, bool silent) { onDirectPacket (d, f, c, late, silent); });
+                         [this] (const float* d, int f, int c, double late, bool silent) { onDirectPacket (d, f, c, late, silent); },
+                         wantShort);
         startedSource = directSourceId;
+        startedShort = wantShort;
         directRetryAtMs = 0;
         silentStrikes = 0;
     }
@@ -432,10 +446,38 @@ void AtmosBridgeProcessor::updateDirect()
     {
         activateDirect();
     }
+    else if (directActive.load())
+    {
+        if (activePolicy != (int) policy)
+            activateDirect();                                   // policy follows the mode
+        // The packet length can change once the short engine period takes effect (or is given up)
+        const int pf = loopback->getPacketFrames();
+        if (pf > 0 && pf != directPacketFrames)
+        {
+            s->feeder.producerPrepare (currentSampleRate, pf);
+            logLine ("Direct loopback: packet length " + std::to_string (directPacketFrames) + " -> " + std::to_string (pf) + " frames");
+            directPacketFrames = pf;
+        }
+    }
 
     st.source = juce::String::fromUTF8 (loopback->getDeviceName().c_str());
     st.reason = directReason;
     st.marginMs = s->feeder.getMarginMs();
+    st.packetMs = loopback->getPacketMs();
+    st.shortPeriod = wantShort && loopback->isShortPeriodActive();
+    if (wantShort)
+    {
+        using PN = LoopbackCapture::PeriodNote;
+        switch (loopback->getPeriodNote())
+        {
+            case PN::Active:      st.periodNote = st.shortPeriod ? juce::String() : tr ("짧은 주기 확인 중"); break;
+            case PN::Unsupported: st.periodNote = tr ("드라이버가 짧은 주기 미지원"); break;
+            case PN::Locked:      st.periodNote = tr ("다른 앱이 주기를 고정함"); break;
+            case PN::NoEffect:    st.periodNote = tr ("패킷이 짧아지지 않아 기본 주기 사용"); break;
+            case PN::Failed:      st.periodNote = tr ("짧은 주기 요청 실패"); break;
+            case PN::NotRequested: default: break;
+        }
+    }
     if (directActive.load())
     {
         st.settleSec = s->feeder.getSettleRemainingSec();
@@ -445,7 +487,7 @@ void AtmosBridgeProcessor::updateDirect()
     else
     {
         st.state = connecting ? DS::Settling : DS::Fallback;
-        st.settleSec = connecting ? OutputFeeder::kAdaptSettleS : 0.0;
+        st.settleSec = connecting ? OutputFeeder::paramsFor (policy).settleS : 0.0;
     }
     setDirectStatus (st);
 }
@@ -498,7 +540,7 @@ void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, in
     //    - an upmixer slot is on (and not bypassed): host channels 1-2 -> upmixer -> inputs 1..12
     //      (L R C LFE SBL SBR SL SR TFL TFR TRL TRR)
     //    - otherwise: host channel n -> input n
-    //    (src = host channels, or the loopback channels in the ultra low latency mode)
+    //    (src = host channels, or the loopback channels with the direct loopback input)
     if (testActive)
     {
         for (int i = 0; i < kNumChannels; ++i)
@@ -761,7 +803,7 @@ void AtmosBridgeProcessor::setDirectSourceId (const juce::String& id)
 {
     directSourceId = id;
     writeExtrasToState();
-    logLine ("Ultra low latency input: " + (id.isEmpty() ? std::string ("<auto: CABLE In 16ch>") : id.toStdString()));
+    logLine ("Direct loopback input: " + (id.isEmpty() ? std::string ("<auto: CABLE In 16ch>") : id.toStdString()));
 }
 
 void AtmosBridgeProcessor::setUiScale (float s)

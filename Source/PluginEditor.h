@@ -3,6 +3,15 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
+#if AB_TEST_HOOKS
+namespace abtest
+{
+    void roomManual (bool manual);   // room neon driven by roomTick() instead of its timer
+    juce::Component* findRoom (juce::Component* editor);
+    void roomTick (juce::Component* editor, double dtSec);
+}
+#endif
+
 class NeonLookAndFeel;
 class RootView;
 struct UiCtx;

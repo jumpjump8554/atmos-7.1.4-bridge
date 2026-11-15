@@ -2,6 +2,8 @@
 #include "Platform.h"
 
 #include <algorithm>
+#include <cmath>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -59,6 +61,10 @@ bool LoopbackCapture::isAutoCandidate (const std::string& friendlyName, bool str
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
+
+#ifndef AUDCLNT_E_ENGINE_PERIODICITY_LOCKED
+ #define AUDCLNT_E_ENGINE_PERIODICITY_LOCKED AUDCLNT_ERR (0x028)
+#endif
 
 namespace ab
 {
@@ -149,6 +155,18 @@ struct LoopbackCapture::Impl
     std::atomic<uint32_t> packets { 0 }, discontinuities { 0 };
     std::atomic<bool> keeperOk { false };
 
+    // short engine period (Ultra low latency+)
+    bool wantShort = false, shortAllowed = true, shortChecked = false;
+    std::atomic<bool> shortActive { false };
+    std::atomic<int> periodNote { 0 };
+    int64_t shortSinceUs = 0;
+    std::atomic<UINT32> defaultPeriod { 0 };
+    static constexpr int kPktHist = 128;
+    std::array<std::atomic<uint32_t>, kPktHist> pktFrames {};
+    std::atomic<uint32_t> pktIndex { 0 };
+    ComPtr<IMMDevice> device;
+    std::vector<uint8_t> mixCopy;
+
     // stream objects (capture thread only)
     ComPtr<IMMDeviceEnumerator> enumerator;
     ComPtr<IAudioClient> capClient, keepClient;
@@ -229,6 +247,12 @@ struct LoopbackCapture::Impl
             return false;
         }
 
+        // Silence keeper first: a silent render stream on the same endpoint keeps the engine (and the loopback)
+        // running; with the short period requested it sets the engine period before the loopback stream opens.
+        device = dev;
+        mixCopy.assign (reinterpret_cast<const uint8_t*> (mix), reinterpret_cast<const uint8_t*> (mix) + sizeof (WAVEFORMATEX) + mix->cbSize);
+        openKeeper (wantShort && shortAllowed);
+
         // Event-driven loopback; the 100 ms buffer only holds data if this thread is ever late (no added latency).
         hr = capClient->Initialize (AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                     1000000, 0, mix, nullptr);
@@ -245,24 +269,6 @@ struct LoopbackCapture::Impl
         }
         conv.assign ((size_t) std::max<UINT32> (bufFrames, 4096) * (size_t) ch, 0.0f);
 
-        // Silence keeper: a silent render stream on the same endpoint keeps the engine (and the loopback) running.
-        keeperOk.store (false);
-        if (SUCCEEDED (dev->Activate (__uuidof (IAudioClient), CLSCTX_ALL, nullptr, (void**) keepClient.ReleaseAndGetAddressOf())))
-        {
-            if (SUCCEEDED (keepClient->Initialize (AUDCLNT_SHAREMODE_SHARED, 0, 500000, 0, mix, nullptr))
-                && SUCCEEDED (keepClient->GetService (__uuidof (IAudioRenderClient), (void**) keeper.ReleaseAndGetAddressOf()))
-                && SUCCEEDED (keepClient->GetBufferSize (&keepFrames)))
-            {
-                topUpSilence();
-                keeperOk.store (SUCCEEDED (keepClient->Start()));
-            }
-        }
-        if (! keeperOk.load())
-        {
-            keeper.Reset();
-            keepClient.Reset();
-            logLine ("Direct loopback: silence keeper not available (loopback pauses while nothing plays)");
-        }
         CoTaskMemFree (mix);
 
         hr = capClient->Start();
@@ -284,15 +290,129 @@ struct LoopbackCapture::Impl
         return true;
     }
 
+    void closeKeeper()
+    {
+        if (keepClient) keepClient->Stop();
+        keeper.Reset();
+        keepClient.Reset();
+        keeperOk.store (false);
+        shortActive.store (false);
+    }
+
+    // Silent render stream; with tryShort it first asks for a ~5 ms engine period (IAudioClient3).
+    void openKeeper (bool tryShort)
+    {
+        closeKeeper();
+        const auto* mix = reinterpret_cast<const WAVEFORMATEX*> (mixCopy.data());
+        if (! device || mixCopy.empty()) return;
+        if (tryShort)
+        {
+            ComPtr<IAudioClient3> c3;
+            UINT32 def = 0, fund = 0, mn = 0, mx = 0;
+            if (FAILED (device->Activate (__uuidof (IAudioClient3), CLSCTX_ALL, nullptr, (void**) c3.GetAddressOf())) || ! c3
+                || FAILED (c3->GetSharedModeEnginePeriod (mix, &def, &fund, &mn, &mx)) || fund == 0)
+            {
+                periodNote.store ((int) PeriodNote::Unsupported);
+            }
+            else
+            {
+                defaultPeriod = def;
+                UINT32 period = std::max (mn, (UINT32) std::lround (sr * 0.005));
+                period = ((period + fund - 1) / fund) * fund;
+                if (mn >= def || period >= def || period > mx)
+                {
+                    periodNote.store ((int) PeriodNote::Unsupported);
+                    logLine ("Direct loopback: short engine period not offered by the driver (default " + std::to_string (def)
+                             + ", min " + std::to_string (mn) + " frames)");
+                }
+                else
+                {
+                    const HRESULT hr = c3->InitializeSharedAudioStream (0, period, mix, nullptr);
+                    if (SUCCEEDED (hr))
+                    {
+                        keepClient = c3;
+                        shortActive.store (true);
+                        shortSinceUs = nowUs();
+                        shortChecked = false;
+                        periodNote.store ((int) PeriodNote::Active);
+                        logLine ("Direct loopback: short engine period " + std::to_string (period) + " frames requested (default "
+                                 + std::to_string (def) + ")");
+                    }
+                    else
+                    {
+                        periodNote.store ((int) (hr == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED ? PeriodNote::Locked : PeriodNote::Failed));
+                        logLine ("Direct loopback: short engine period refused " + hex (hr));
+                    }
+                }
+            }
+        }
+        else if (! wantShort)
+            periodNote.store ((int) PeriodNote::NotRequested);
+
+        if (! keepClient)
+        {
+            if (FAILED (device->Activate (__uuidof (IAudioClient), CLSCTX_ALL, nullptr, (void**) keepClient.ReleaseAndGetAddressOf()))
+                || FAILED (keepClient->Initialize (AUDCLNT_SHAREMODE_SHARED, 0, 500000, 0, mix, nullptr)))
+                keepClient.Reset();
+        }
+        if (keepClient
+            && SUCCEEDED (keepClient->GetService (__uuidof (IAudioRenderClient), (void**) keeper.ReleaseAndGetAddressOf()))
+            && SUCCEEDED (keepClient->GetBufferSize (&keepFrames)))
+        {
+            topUpSilence();
+            keeperOk.store (SUCCEEDED (keepClient->Start()));
+        }
+        if (! keeperOk.load())
+        {
+            closeKeeper();
+            logLine ("Direct loopback: silence keeper not available (loopback pauses while nothing plays)");
+        }
+    }
+
+    // After ~3 s with the short period: if the loopback packets did not get shorter, go back to the normal
+    // period (only the silent keeper stream is reopened; the capture stream keeps running).
+    void checkShortPeriod()
+    {
+        if (! shortActive.load() || shortChecked || nowUs() - shortSinceUs < 3000000) return;
+        shortChecked = true;
+        const int frames = typicalPacketFrames();
+        if (frames > 0 && defaultPeriod > 0 && (UINT32) frames * 4 > defaultPeriod * 3)
+        {
+            logLine ("Direct loopback: loopback packets stay at " + std::to_string (frames)
+                     + " frames with the short period -> back to the normal period");
+            shortAllowed = false;
+            openKeeper (false);
+            periodNote.store ((int) PeriodNote::NoEffect);
+        }
+        else
+            logLine ("Direct loopback: loopback packets " + std::to_string (frames) + " frames with the short period");
+    }
+
+    int typicalPacketFrames() const noexcept
+    {
+        // most frequent packet length of the last 128 packets
+        std::array<uint32_t, kPktHist> v {};
+        int n = 0;
+        for (auto& f : pktFrames) { const uint32_t x = f.load (std::memory_order_relaxed); if (x > 0) v[(size_t) n++] = x; }
+        if (n == 0) return 0;
+        std::sort (v.begin(), v.begin() + n);
+        uint32_t best = v[0]; int bestN = 0;
+        for (int i = 0; i < n;)
+        {
+            int j = i; while (j < n && v[(size_t) j] == v[(size_t) i]) ++j;
+            if (j - i > bestN) { bestN = j - i; best = v[(size_t) i]; }
+            i = j;
+        }
+        return (int) best;
+    }
+
     void close()
     {
         if (capClient) capClient->Stop();
-        if (keepClient) keepClient->Stop();
+        closeKeeper();
         capture.Reset();
-        keeper.Reset();
         capClient.Reset();
-        keepClient.Reset();
-        keeperOk.store (false);
+        device.Reset();
     }
 
     void topUpSilence()
@@ -364,6 +484,7 @@ struct LoopbackCapture::Impl
             }
 
             capture->ReleaseBuffer (frames);
+            pktFrames[(size_t) (pktIndex.fetch_add (1, std::memory_order_relaxed) % kPktHist)].store (frames, std::memory_order_relaxed);
             packets.fetch_add (1, std::memory_order_relaxed);
             lastPacketUs.store (nowUs(), std::memory_order_relaxed);
         }
@@ -395,6 +516,7 @@ struct LoopbackCapture::Impl
                 const DWORD w = WaitForMultipleObjects (2, h, FALSE, 20);
                 if (stopFlag.load()) break;
                 topUpSilence();
+                checkShortPeriod();
                 if (w == WAIT_TIMEOUT && ++quiet < 100) { if (! drain()) break; continue; }
                 quiet = 0;
                 if (! drain()) break;
@@ -429,9 +551,13 @@ LoopbackCapture::~LoopbackCapture()
     if (impl->captureEvent) CloseHandle (impl->captureEvent);
 }
 
-void LoopbackCapture::start (const std::string& sourceId, const std::string& excludeName, PacketFn onPacket)
+void LoopbackCapture::start (const std::string& sourceId, const std::string& excludeName, PacketFn onPacket, bool shortPeriod)
 {
     stop();
+    impl->wantShort = shortPeriod;
+    impl->shortAllowed = true;
+    impl->periodNote.store (0);
+    for (auto& f : impl->pktFrames) f.store (0);
     impl->sourceId = sourceId;
     impl->excludeName = excludeName;
     impl->onPacket = std::move (onPacket);
@@ -462,6 +588,19 @@ int64_t LoopbackCapture::getLastPacketUs() const noexcept   { return impl->lastP
 uint32_t LoopbackCapture::getPackets() const noexcept       { return impl->packets.load(); }
 uint32_t LoopbackCapture::getDiscontinuities() const noexcept { return impl->discontinuities.load(); }
 bool LoopbackCapture::hasSilenceKeeper() const noexcept     { return impl->keeperOk.load(); }
+int LoopbackCapture::getPacketFrames() const noexcept       { return impl->typicalPacketFrames(); }
+double LoopbackCapture::getPacketMs() const noexcept
+{
+    const double r = impl->rate.load();
+    return r > 0.0 ? 1000.0 * (double) impl->typicalPacketFrames() / r : 0.0;
+}
+bool LoopbackCapture::isShortPeriodActive() const noexcept
+{
+    if (! impl->shortActive.load() || impl->defaultPeriod == 0) return false;
+    const int f = impl->typicalPacketFrames();
+    return f > 0 && (UINT32) f * 4 <= impl->defaultPeriod * 3;
+}
+LoopbackCapture::PeriodNote LoopbackCapture::getPeriodNote() const noexcept { return (PeriodNote) impl->periodNote.load(); }
 } // namespace ab
 
 //==============================================================================
@@ -472,7 +611,7 @@ namespace ab
 struct LoopbackCapture::Impl { bool started = false; };
 LoopbackCapture::LoopbackCapture() : impl (std::make_unique<Impl>()) {}
 LoopbackCapture::~LoopbackCapture() = default;
-void LoopbackCapture::start (const std::string&, const std::string&, PacketFn) { impl->started = true; }
+void LoopbackCapture::start (const std::string&, const std::string&, PacketFn, bool) { impl->started = true; }
 void LoopbackCapture::stop() { impl->started = false; }
 bool LoopbackCapture::isStarted() const noexcept { return impl->started; }
 LoopbackStatus LoopbackCapture::getStatus() const noexcept { return impl->started ? LoopbackStatus::Unsupported : LoopbackStatus::Stopped; }
@@ -484,6 +623,10 @@ int64_t LoopbackCapture::getLastPacketUs() const noexcept { return 0; }
 uint32_t LoopbackCapture::getPackets() const noexcept { return 0; }
 uint32_t LoopbackCapture::getDiscontinuities() const noexcept { return 0; }
 bool LoopbackCapture::hasSilenceKeeper() const noexcept { return false; }
+double LoopbackCapture::getPacketMs() const noexcept { return 0.0; }
+int LoopbackCapture::getPacketFrames() const noexcept { return 0; }
+bool LoopbackCapture::isShortPeriodActive() const noexcept { return false; }
+LoopbackCapture::PeriodNote LoopbackCapture::getPeriodNote() const noexcept { return PeriodNote::NotRequested; }
 } // namespace ab
 
 #endif

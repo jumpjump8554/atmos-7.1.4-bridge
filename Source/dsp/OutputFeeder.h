@@ -30,20 +30,49 @@ public:
     static constexpr double kLowMaxExtraMs   = 60.0;  // Low mode grows by 10 ms per dropout, up to +60 ms
     static constexpr double kUltraMarginMs   = 4.5;
 
-    // Adaptive margin (ultra low latency with the direct loopback input): instead of a fixed margin,
-    // the margin follows the measured jitter of the input packets so the output never runs dry.
+    // Adaptive margin (direct loopback input: Low latency and Ultra low latency+). Instead of a fixed margin,
+    // the margin follows the measured lateness ("jitter") of the input packets so the output never runs dry.
     //  - first 2 minutes: 15 ms while the jitter of this PC is measured
-    //  - then: the worst jitter of the last 10 minutes (+1.5 ms), never less; a near miss grows it at once
-    //  - every change is made by a tiny speed change (max 0.3 %), never by skipping or inserting audio
-    //  - if the input still runs dry, the gap is concealed (the last 10 ms mirrored and faded) instead of
+    //  - then the margin goes straight to what the measurement needs; a near miss or a later-than-ever packet
+    //    raises it at once and the raised value is kept for 10 minutes
+    //  - every change is made by a tiny speed change (max 0.3 %, 0.5 % while refilling), never by skipping
+    //    or inserting audio
+    //  - if the input still runs dry, the gap is concealed (the last period mirrored and faded) instead of
     //    a silent gap and a re-prime, and the margin grows by the shortfall
-    static constexpr double kAdaptStartMs = 15.0;
-    static constexpr double kAdaptSettleS = 120.0;
     static constexpr double kAdaptMinMs   = 1.0;
     static constexpr double kAdaptMaxMs   = 25.0;
     static constexpr double kNearMissMs   = 0.75;
-    static constexpr double kAdaptHoldS   = 600.0;
     static constexpr int    kJitBuckets   = 10;     // 10 x 60 s
+
+    // Two policies for the direct loopback input:
+    //  Safe (Low latency):      margin = worst lateness of the last 10 minutes + 1.5 ms.
+    //  Fast (Ultra low latency+): phase-aware. A late packet only empties the buffer if the output pass that
+    //      needs it comes before the packet. With phase p = time from a packet's nominal arrival to the next
+    //      output pass, the margin only has to cover the lateness where the phase makes it necessary:
+    //          margin = largest (p + k * period) below the worst lateness, + 1 ms guard
+    //      The phase moves only as fast as the two clocks drift apart (tens of ppm); it is tracked
+    //      continuously and the margin is raised ahead of time (phases up to 1.5 ms earlier are covered).
+    enum class AdaptPolicy : int { Safe = 0, Fast = 1 };
+    struct PolicyParams { double startMs, addMs, holdS, settleS; bool phaseAware; };
+    static PolicyParams paramsFor (AdaptPolicy p) noexcept
+    {
+        if (p == AdaptPolicy::Fast) return { 15.0, 1.0, 600.0, 120.0, true };
+        return { 15.0, 1.5, 600.0, 120.0, false };
+    }
+
+    // Margin needed for lateness j at phase p (all ms), looking lookMs ahead (phase moving to lower values,
+    // wrapping around the packet period).
+    static double phaseMarginMs (double jMs, double pMs, double periodMs, double guardMs, double lookMs) noexcept
+    {
+        double need = 0.0;
+        for (double d = 0.0; d <= lookMs + 1e-9; d += 0.25)
+        {
+            double q = std::fmod (pMs - d, periodMs);
+            if (q < 0.0) q += periodMs;
+            for (double v = q; v < jMs; v += periodMs) need = std::max (need, v + guardMs);
+        }
+        return need;
+    }
 
     explicit OutputFeeder (int numChannels) : numCh (numChannels)
     {
@@ -110,16 +139,22 @@ public:
         if (lateMs < minLate) minLate = lateMs;
         else minLate += 0.0005;   // follows a rising baseline (0.05 ms/s at 100 packets/s)
         const float jitter = (float) std::max (0.0, lateMs - minLate);
+        lastJitterMs.store (jitter, std::memory_order_relaxed);
         const int b = (int) ((nowMicros() / 60000000) % kJitBuckets);
-        if (b != curBucket) { curBucket = b; jitBucket[(size_t) b].store (0.0f, std::memory_order_relaxed); }
+        if (b != curBucket)
+        {
+            curBucket = b;
+            jitBucket[(size_t) b].store (0.0f, std::memory_order_relaxed);
+        }
         auto& slot = jitBucket[(size_t) b];
         float prev = slot.load (std::memory_order_relaxed);
         while (jitter > prev && ! slot.compare_exchange_weak (prev, jitter, std::memory_order_relaxed)) {}
     }
 
     //==================================================== settings (any thread)
-    void setAdaptive (bool on) noexcept
+    void setAdaptive (bool on, AdaptPolicy policy = AdaptPolicy::Safe) noexcept
     {
+        adaptPolicy.store ((int) policy, std::memory_order_relaxed);
         adaptiveReq.store (on, std::memory_order_relaxed);
         adaptiveChanged.store (true, std::memory_order_release);
         if (on)
@@ -128,6 +163,8 @@ public:
             latenessReset.store (true, std::memory_order_release);
         }
     }
+    AdaptPolicy getAdaptPolicy() const noexcept { return (AdaptPolicy) adaptPolicy.load(); }
+    double getPhaseMs() const noexcept { return phaseMs.load(); }
     bool isAdaptive() const noexcept { return adaptiveOn.load (std::memory_order_relaxed); }
     double getSettleRemainingSec (int64_t now = nowMicros()) const noexcept
     {
@@ -153,12 +190,12 @@ public:
     // Current safety margin in ms (Low mode includes the automatic growth after dropouts).
     double getMarginMs() const noexcept
     {
+        if (adaptiveOn.load (std::memory_order_relaxed)) return adaptMarginMs.load (std::memory_order_relaxed);
         switch (mode.load (std::memory_order_relaxed))
         {
             case 0:  return kMusicMarginMs;
             case 1:  return kLowMarginMs + lowExtraMs.load (std::memory_order_relaxed);
-            default: return adaptiveOn.load (std::memory_order_relaxed) ? adaptMarginMs.load (std::memory_order_relaxed)
-                                                                         : kUltraMarginMs;
+            default: return kUltraMarginMs;
         }
     }
 
@@ -187,14 +224,15 @@ public:
             adaptiveOn.store (on, std::memory_order_relaxed);
             if (on)
             {
-                adaptMarginMs.store (kAdaptStartMs);
-                floorMs = kAdaptStartMs;
-                holdUntilUs = nowUs + (int64_t) (kAdaptSettleS * 1e6);
+                pp = paramsFor ((AdaptPolicy) adaptPolicy.load());
+                adaptMarginMs.store (pp.startMs);
+                floorMs = pp.startMs;
+                holdUntilUs = nowUs + (int64_t) (pp.settleS * 1e6);
                 settleUntilUs.store (holdUntilUs);
-                winMin = 1e9; winN = 0; concealRun = 0;
+                winN = 0; concealRun = 0;
             }
         }
-        const bool adaptive = adaptiveOn.load (std::memory_order_relaxed) && mode.load (std::memory_order_relaxed) == 2;
+        const bool adaptive = adaptiveOn.load (std::memory_order_relaxed);
 
         const int64_t sincePushUs = nowUs - lastPushUs.load (std::memory_order_relaxed);
         const bool producerAlive = sincePushUs < 300000;
@@ -298,7 +336,7 @@ public:
             const double m = std::min (kAdaptMaxMs, adaptMarginMs.load() + shortMs + 3.0);
             adaptMarginMs.store (m);
             floorMs = m;
-            holdUntilUs = nowUs + (int64_t) (kAdaptHoldS * 1e6);
+            holdUntilUs = nowUs + (int64_t) (pp.holdS * 1e6);
             conceal (out, numOut);
             return;
         }
@@ -337,14 +375,17 @@ public:
 
         if (adaptive)
         {
-            // A packet later than ever seen before: raise the margin now (not at the next 30 s check).
-            const double needNow = getMaxJitterMs() + 1.5;
-            if (needNow > adaptMarginMs.load())
+            const bool settling = nowUs < settleUntilUs.load();
+            // Safe: a packet later than ever seen before raises the margin now (not at the next check).
+            if (! pp.phaseAware && ! settling)
             {
-                const double m = std::min (kAdaptMaxMs, needNow);
-                adaptMarginMs.store (m);
-                floorMs = std::max (floorMs, m);
-                holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (kAdaptHoldS * 1e6));
+                const double needNow = std::min (kAdaptMaxMs, getMaxJitterMs() + pp.addMs);
+                if (needNow > adaptMarginMs.load())
+                {
+                    adaptMarginMs.store (needNow);
+                    floorMs = std::max (floorMs, needNow);
+                    holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (pp.holdS * 1e6));
+                }
             }
 
             // Headroom right before this read; a near miss grows the margin before anything is heard.
@@ -354,19 +395,43 @@ public:
                 const double m = std::min (kAdaptMaxMs, adaptMarginMs.load() + 1.0);
                 adaptMarginMs.store (m);
                 floorMs = std::max (floorMs, m - 1.0);
-                holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (kAdaptHoldS * 1e6));
+                holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (pp.holdS * 1e6));
             }
-            winMin = std::min (winMin, slackMs);
-            if (++winN >= 3000) // ~30 s
+
+            // Phase tracking (time since the last packet's nominal arrival, circular mean over ~1 s)
+            if (pp.phaseAware && blk > 0)
             {
-                // The margin is exactly the headroom left right before the next packet is due, so it has to
-                // cover the worst lateness seen (+1.5 ms).
-                const double needMs = std::clamp (getMaxJitterMs() + 1.5, kAdaptMinMs, kAdaptMaxMs);
-                if (nowUs > holdUntilUs) floorMs = needMs;
-                double m = adaptMarginMs.load();
-                if (winMin > 2.0) m = std::max (std::max (floorMs, needMs), m - 0.3 * (winMin - 1.5));
-                adaptMarginMs.store (std::clamp (std::max (m, needMs), kAdaptMinMs, kAdaptMaxMs));
-                winMin = 1e9;
+                const double periodMs = 1000.0 * (double) blk / hr;
+                const double p = std::fmod ((double) sincePushUs * 1e-3 + (double) lastJitterMs.load (std::memory_order_relaxed), periodMs);
+                const double a = 2.0 * 3.14159265358979 * p / periodMs;
+                phaseC += 0.02 * (std::cos (a) - phaseC);
+                phaseS += 0.02 * (std::sin (a) - phaseS);
+                double pm = std::atan2 (phaseS, phaseC) / (2.0 * 3.14159265358979) * periodMs;
+                if (pm < 0.0) pm += periodMs;
+                phaseMs.store (pm, std::memory_order_relaxed);
+                if (! settling && winN % 10 == 0)     // every ~100 ms
+                {
+                    const double j = getMaxJitterMs() + 0.25;
+                    const double needMs = std::clamp (std::max (kAdaptMinMs, phaseMarginMs (j, pm, periodMs, pp.addMs, 1.5)), kAdaptMinMs, kAdaptMaxMs);
+                    adaptMarginMs.store (std::max (needMs, floorMs > needMs && nowUs <= holdUntilUs ? floorMs : needMs));
+                }
+            }
+
+            // Every ~10 s (after the measuring phase): margin = measured lateness (+ policy safety),
+            // never below the floor kept after a concealment / near miss. The change itself is made
+            // by the speed control above (no audio skipped or inserted).
+            if (++winN >= 1000 && ! settling)
+            {
+                if (pp.phaseAware)
+                {
+                    if (nowUs > holdUntilUs) floorMs = kAdaptMinMs;
+                }
+                else
+                {
+                    const double needMs = std::clamp (getMaxJitterMs() + pp.addMs, kAdaptMinMs, kAdaptMaxMs);
+                    if (nowUs > holdUntilUs) floorMs = needMs;
+                    adaptMarginMs.store (std::clamp (std::max (floorMs, needMs), kAdaptMinMs, kAdaptMaxMs));
+                }
                 winN = 0;
             }
         }
@@ -458,12 +523,17 @@ private:
 
     // adaptive margin
     std::atomic<bool> adaptiveReq { false }, adaptiveChanged { false }, adaptiveOn { false }, latenessReset { false };
-    std::atomic<double> adaptMarginMs { kAdaptStartMs };
+    std::atomic<int> adaptPolicy { 0 };
+    std::atomic<double> adaptMarginMs { 15.0 };
+    PolicyParams pp = paramsFor (AdaptPolicy::Safe);       // consumer only
+    double phaseC = 1.0, phaseS = 0.0;                      // consumer only
+    std::atomic<float> lastJitterMs { 0.0f };
+    std::atomic<double> phaseMs { 0.0 };
     std::atomic<int64_t> settleUntilUs { 0 };
     std::array<std::atomic<float>, kJitBuckets> jitBucket;
     std::atomic<uint32_t> concealed { 0 };
     double minLate = 1e9; int curBucket = -1;               // producer only
-    double floorMs = kAdaptStartMs, winMin = 1e9;           // consumer only
+    double floorMs = 15.0;                                  // consumer only
     int64_t holdUntilUs = 0; int winN = 0, concealRun = 0, lastN = 0;
     bool fadeInPending = false;
     std::vector<std::vector<float>> lastOut;
