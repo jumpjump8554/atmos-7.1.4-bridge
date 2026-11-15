@@ -30,7 +30,9 @@ namespace col
 juce::Font uiFont (float height, bool bold = false)
 {
    #if JUCE_WINDOWS
-    const juce::String name ("Malgun Gothic");
+    const juce::String name ("Malgun Gothic");   // Korean UI font included with Windows
+   #elif defined (AB_UI_FONT)
+    const juce::String name (AB_UI_FONT);
    #else
     const juce::String name (juce::Font::getDefaultSansSerifFontName());
    #endif
@@ -133,7 +135,7 @@ public:
     juce::Font getComboBoxFont (juce::ComboBox& box) override
     {
         const bool mono = (bool) box.getProperties().getWithDefault ("mono", false);
-        return mono ? monoFont (16.0f) : uiFont (14.0f);
+        return mono ? monoFont (16.0f) : uiFont (15.0f);
     }
 
     void positionComboBoxText (juce::ComboBox& box, juce::Label& label) override
@@ -242,10 +244,10 @@ public:
 
         // Title
         g.setColour (col::text);
-        g.setFont (uiFont (16.0f, true));
+        g.setFont (uiFont (17.0f, true));
         g.drawText (tr ("7.1.4 스피커 배치"), 0, 10, 780, 22, juce::Justification::centred);
         g.setColour (col::sub);
-        g.setFont (uiFont (13.5f));
+        g.setFont (uiFont (15.5f));
         g.drawText (tr ("스피커를 클릭하면 해당 위치로 핑크 노이즈 출력"), 0, 32, 780, 18, juce::Justification::centred);
 
         // Screen and listening position
@@ -398,7 +400,6 @@ public:
         resetBtn.onClick = [this] { proc.resetMapping(); };
         addAndMakeVisible (resetBtn);
 
-        allMuteBtn.getProperties().set ("bold", true);
         allMuteBtn.onClick = [this] { proc.setAllMuted (! proc.areAllMuted()); };
         addAndMakeVisible (allMuteBtn);
     }
@@ -465,7 +466,7 @@ public:
         g.setFont (uiFont (18.0f, true));
         g.drawText (tr ("채널 매핑"), 18, 16, 200, 22, juce::Justification::centredLeft);
         g.setColour (col::sub);
-        g.setFont (uiFont (13.0f));
+        g.setFont (uiFont (14.5f));
         g.drawText (tr ("입력 채널마다 출력 위치 번호를 지정합니다. 0 = 끄기"), 18, 40, 300, 18, juce::Justification::centredLeft, true);
 
         bool anyDup = false;
@@ -475,12 +476,12 @@ public:
             juce::Rectangle<float> banner (18, 64, 404, 26);
             g.setColour (juce::Colour (0xff2a2210)); g.fillRoundedRectangle (banner, 6);
             g.setColour (juce::Colour (0xff5a4818)); g.drawRoundedRectangle (banner, 6, 1);
-            g.setColour (col::amber); g.setFont (uiFont (13.0f));
+            g.setColour (col::amber); g.setFont (uiFont (14.5f));
             g.drawText (tr ("같은 번호가 중복되어 해당 위치에 합산됩니다."), banner.reduced (10, 0).toNearestInt(), juce::Justification::centredLeft);
         }
 
         g.setColour (col::sub);
-        g.setFont (uiFont (12.5f));
+        g.setFont (uiFont (14.0f));
         g.drawText (tr ("입력"), 18, 94, 50, 16, juce::Justification::centredLeft);
         g.drawText (tr ("번호"), 76, 94, 56, 16, juce::Justification::centredLeft);
         g.drawText (tr ("출력 위치"), 140, 94, 80, 16, juce::Justification::centredLeft);
@@ -510,7 +511,7 @@ public:
             {
                 juce::Rectangle<float> tag (184, (float) y + 11, 34, 15);
                 g.setColour (juce::Colour (0xff5a4818)); g.drawRoundedRectangle (tag, 4, 1);
-                g.setColour (col::amber); g.setFont (uiFont (11.0f));
+                g.setColour (col::amber); g.setFont (uiFont (12.0f));
                 g.drawText (tr ("중복"), tag.toNearestInt(), juce::Justification::centred);
             }
 
@@ -529,7 +530,7 @@ public:
         }
 
         g.setColour (col::sub);
-        g.setFont (uiFont (12.5f));
+        g.setFont (uiFont (13.5f));
         g.drawText (tr ("핑크 노이즈 -20 dBFS RMS (LFE는 120 Hz 이하) · 테스트 중에는 음악이 잠시 멈춥니다"),
                     18, kRowY0 + kNumChannels * kRowH + 14, 404, 32, juce::Justification::topLeft, true);
     }
@@ -661,7 +662,7 @@ public:
         g.setFont (uiFont (21.0f, true));
         g.drawText (JucePlugin_Name, 78, 28, 320, 24, juce::Justification::centredLeft);
         g.setColour (col::sub);
-        g.setFont (uiFont (13.0f));
+        g.setFont (uiFont (14.0f));
         g.drawText (tr ("Windows Spatial Audio \xe2\x86\x92 Dolby Atmos (MAT)"), 78, 52, 320, 16, juce::Justification::centredLeft);
 
         // Status pill
@@ -669,7 +670,7 @@ public:
         g.setColour (statusColour.withAlpha (0.10f)); g.fillRoundedRectangle (pill, 16);
         g.setColour (statusColour.withAlpha (0.45f)); g.drawRoundedRectangle (pill.reduced (0.5f), 16, 1);
         g.setColour (statusColour); g.fillEllipse (pill.getX() + 13, pill.getCentreY() - 4, 8, 8);
-        g.setColour (col::text); g.setFont (uiFont (14.0f));
+        g.setColour (col::text); g.setFont (uiFont (15.5f));
         g.drawText (statusText, pill.withTrimmedLeft (28).withTrimmedRight (10).toNearestInt(), juce::Justification::centredLeft, true);
 
         // Rate pill
@@ -690,17 +691,17 @@ public:
         g.setColour (col::panel); g.fillRoundedRectangle (footer, 10);
         g.setColour (col::border); g.drawRoundedRectangle (footer.reduced (0.5f), 10, 1);
 
-        g.setColour (col::sub); g.setFont (uiFont (13.5f));
+        g.setColour (col::sub); g.setFont (uiFont (15.0f));
         g.drawText (testText, 298, 744, 220, 36, juce::Justification::centredLeft, true);
 
-        g.setColour (col::sub); g.setFont (uiFont (14.0f));
+        g.setColour (col::sub); g.setFont (uiFont (15.5f));
         g.drawText (modeText, 512, 744, 400, 36, juce::Justification::centredRight, true);
 
         g.setColour (dropouts > 0 ? col::amber : col::sub);
         g.drawText (tr ("끊김 ") + juce::String (dropouts), dropoutArea.toNearestInt(), juce::Justification::centred);
 
         g.setColour (clockColour); g.fillEllipse (1012, 758, 8, 8);
-        g.setColour (col::text); g.setFont (uiFont (13.5f));
+        g.setColour (col::text); g.setFont (uiFont (15.0f));
         g.drawText (clockText, 1026, 744, 222, 36, juce::Justification::centredLeft, true);
     }
 
