@@ -53,6 +53,8 @@ AtmosBridgeProcessor::AtmosBridgeProcessor()
 AtmosBridgeProcessor::~AtmosBridgeProcessor()
 {
     stopTimer();
+    cancelPendingUpdate();
+    upmixer.unload();
     releaseOutput();
 }
 
@@ -91,6 +93,9 @@ void AtmosBridgeProcessor::timerCallback()
     if (owner.load() == nullptr)
         tryClaimOutput();
 
+    if (upmixer.refreshLatency())
+        updateLatency();
+
     // Every 5 s while audio is flowing: one diagnostics line in the log.
     if (auto* s = getSharedOutput())
     {
@@ -128,6 +133,9 @@ void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
         inMeanSq[(size_t) c] = 0.0f;
         posMeanSq[(size_t) c] = 0.0f;
     }
+
+    upmixer.prepare (currentSampleRate, chunk);
+    updateLatency();
 
     // Pink noise is generated here, once (4 s loop), so the audio thread only copies it.
     noise.build (currentSampleRate, 4.0, juce::Decibels::decibelsToGain (kNoiseDbfs), kLfeNoiseCutHz);
@@ -214,23 +222,42 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
     seqWasOn = seqOn;
     const bool testActive = iNoise >= 0 || pNoise >= 0;
 
-    // 1) Inputs: host channel n -> input n (program audio is silenced while a test signal plays)
-    for (int i = 0; i < kNumChannels; ++i)
+    // 1) Inputs (program audio is silenced while a test signal plays)
+    //    - built-in upmixer active: host channels 1-2 -> upmixer -> inputs 1..12 (L R C LFE SBL SBR SL SR TFL TFR TRL TRR)
+    //    - otherwise: host channel n -> input n
+    if (testActive)
     {
-        float* dst = inPtrs[(size_t) i];
-        if (testActive)
+        for (int i = 0; i < kNumChannels; ++i)
         {
+            float* dst = inPtrs[(size_t) i];
             if (i == iNoise)
                 noise.read (dst, n, outMap[(size_t) i].load (std::memory_order_relaxed) == kLfePos);
             else
                 juce::FloatVectorOperations::clear (dst, n);
-            continue;
         }
-        const int src = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
-        if (src >= 0 && src < numIn)
-            juce::FloatVectorOperations::copy (dst, buffer.getReadPointer (src, start), n);
-        else
-            juce::FloatVectorOperations::clear (dst, n);
+    }
+    else if (upmixer.isActive())
+    {
+        auto hostPtr = [&] (int i) -> const float*
+        {
+            const int src = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
+            return (src >= 0 && src < numIn) ? buffer.getReadPointer (src, start) : nullptr;
+        };
+        if (! upmixer.process (hostPtr (0), hostPtr (1), inPtrs.data(), n))
+            for (int i = 0; i < kNumChannels; ++i)
+                juce::FloatVectorOperations::clear (inPtrs[(size_t) i], n); // upmixer being swapped
+    }
+    else
+    {
+        for (int i = 0; i < kNumChannels; ++i)
+        {
+            float* dst = inPtrs[(size_t) i];
+            const int src = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
+            if (src >= 0 && src < numIn)
+                juce::FloatVectorOperations::copy (dst, buffer.getReadPointer (src, start), n);
+            else
+                juce::FloatVectorOperations::clear (dst, n);
+        }
     }
 
     // 2) Mute with a 10 ms ramp (also applies to the input test noise)
@@ -405,6 +432,66 @@ void AtmosBridgeProcessor::setUiScale (float s)
 }
 
 //==============================================================================
+bool AtmosBridgeProcessor::loadUpmixer (const juce::String& path)
+{
+    pendingUpmixer.valid = false;
+    if (! upmixer.load (path)) return false;
+    upmixer.setEnabled (true);
+    if (upmixer.getInfo().namedLayout)
+        resetMapping(); // channels already arrive in L R C LFE SBL SBR SL SR TFL TFR TRL TRR order
+    writeExtrasToState();
+    updateLatency();
+    return true;
+}
+
+void AtmosBridgeProcessor::unloadUpmixer()
+{
+    pendingUpmixer.valid = false;
+    upmixer.unload();
+    writeExtrasToState();
+    updateLatency();
+}
+
+void AtmosBridgeProcessor::setUpmixerEnabled (bool shouldBeEnabled)
+{
+    upmixer.setEnabled (shouldBeEnabled);
+    writeExtrasToState();
+    updateLatency();
+    logLine (std::string ("Upmixer ") + (shouldBeEnabled ? "enabled" : "bypassed"));
+}
+
+double AtmosBridgeProcessor::getUpmixerLatencyMs() const noexcept
+{
+    return upmixer.isActive() ? 1000.0 * upmixer.getInfo().latencySamples / currentSampleRate : 0.0;
+}
+
+void AtmosBridgeProcessor::updateLatency()
+{
+    setLatencySamples (upmixer.isActive() ? upmixer.getInfo().latencySamples : 0);
+}
+
+void AtmosBridgeProcessor::handleAsyncUpdate()
+{
+    if (! pendingUpmixer.valid) return;
+    const auto p = pendingUpmixer;
+    pendingUpmixer.valid = false;
+
+    if (p.path.isEmpty())
+    {
+        upmixer.unload();
+    }
+    else
+    {
+        if (! upmixer.getInfo().loaded || upmixer.getInfo().path != p.path)
+            upmixer.load (p.path);
+        if (upmixer.getInfo().loaded)
+            upmixer.setStateBase64 (p.state);
+    }
+    upmixer.setEnabled (p.enabled);
+    updateLatency();
+}
+
+//==============================================================================
 void AtmosBridgeProcessor::writeExtrasToState()
 {
     juce::StringArray map;
@@ -415,7 +502,10 @@ void AtmosBridgeProcessor::writeExtrasToState()
     s.setProperty ("map", map.joinIntoString (","), nullptr);
     s.setProperty ("outputDevice", outputDeviceId, nullptr);
     s.setProperty ("uiScale", uiScale, nullptr);
-    s.setProperty ("stateVersion", 1, nullptr);
+    s.setProperty ("upmixerPath", upmixer.getInfo().loaded ? upmixer.getInfo().path
+                                                           : (pendingUpmixer.valid ? pendingUpmixer.path : juce::String()), nullptr);
+    s.setProperty ("upmixerEnabled", upmixer.isEnabled(), nullptr);
+    s.setProperty ("stateVersion", 2, nullptr);
 }
 
 void AtmosBridgeProcessor::readExtrasFromState()
@@ -428,6 +518,12 @@ void AtmosBridgeProcessor::readExtrasFromState()
 
     uiScale = juce::jlimit (0.5f, 1.5f, (float) s.getProperty ("uiScale", 0.9f));
 
+    pendingUpmixer.path = s.getProperty ("upmixerPath", "").toString();
+    pendingUpmixer.state = s.getProperty ("upmixerState", "").toString();
+    pendingUpmixer.enabled = (bool) s.getProperty ("upmixerEnabled", true);
+    pendingUpmixer.valid = true;
+    triggerAsyncUpdate(); // plugins must be loaded on the message thread
+
     const juce::String dev = s.getProperty ("outputDevice", "").toString();
     if (dev != outputDeviceId)
     {
@@ -439,7 +535,11 @@ void AtmosBridgeProcessor::readExtrasFromState()
 void AtmosBridgeProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     writeExtrasToState();
-    if (auto xml = apvts.copyState().createXml())
+    auto state = apvts.copyState();
+    // The hosted upmixer's own settings travel with ours.
+    state.setProperty ("upmixerState", upmixer.getInfo().loaded ? upmixer.getStateBase64()
+                                                               : (pendingUpmixer.valid ? pendingUpmixer.state : juce::String()), nullptr);
+    if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
 

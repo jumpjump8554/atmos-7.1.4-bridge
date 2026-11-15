@@ -248,7 +248,7 @@ public:
         g.drawText (tr ("7.1.4 스피커 배치"), 0, 10, 780, 22, juce::Justification::centred);
         g.setColour (col::sub);
         g.setFont (uiFont (15.5f));
-        g.drawText (tr ("스피커를 클릭하면 해당 위치로 핑크 노이즈 출력"), 0, 32, 780, 18, juce::Justification::centred);
+        g.drawText (tr ("스피커를 클릭하면 해당 위치로 핑크 노이즈(-20 dBFS) 출력"), 0, 32, 780, 18, juce::Justification::centred);
 
         // Screen and listening position
         g.setColour (juce::Colour (0xff1b2024)); g.fillRoundedRectangle (270, 190, 240, 100, 3);
@@ -362,6 +362,31 @@ private:
 };
 
 //==============================================================================
+// Window showing the hosted upmixer's own editor.
+class HostedPluginWindow final : public juce::DocumentWindow
+{
+public:
+    HostedPluginWindow (juce::AudioPluginInstance& p, std::function<void()> onCloseRequested)
+        : juce::DocumentWindow (p.getName() + " (Atmos Bridge)", col::bg, juce::DocumentWindow::closeButton),
+          onClose (std::move (onCloseRequested))
+    {
+        setUsingNativeTitleBar (true);
+        juce::AudioProcessorEditor* ed = p.createEditorAndMakeActive();
+        if (ed == nullptr) ed = new juce::GenericAudioProcessorEditor (p);
+        setContentOwned (ed, true);
+        setResizable (ed->isResizable(), false);
+        centreWithSize (juce::jmax (200, getWidth()), juce::jmax (100, getHeight()));
+        setVisible (true);
+        toFront (true);
+    }
+
+    void closeButtonPressed() override { if (onClose) onClose(); }
+
+private:
+    std::function<void()> onClose;
+};
+
+//==============================================================================
 class MapPanel final : public juce::Component
 {
 public:
@@ -402,9 +427,25 @@ public:
 
         allMuteBtn.onClick = [this] { proc.setAllMuted (! proc.areAllMuted()); };
         addAndMakeVisible (allMuteBtn);
+
+        pickBtn.setButtonText (tr ("업믹서 선택\xe2\x80\xa6"));
+        pickBtn.setTooltip (tr ("VST3 업믹서(예: zAuro Pro 2D-3D)를 Atmos Bridge 안에서 스테레오 \xe2\x86\x92 7.1.4로 엽니다"));
+        pickBtn.onClick = [this] { showUpmixerMenu(); };
+        addAndMakeVisible (pickBtn);
+
+        openBtn.setButtonText (tr ("창 열기"));
+        openBtn.setTooltip (tr ("업믹서 설정 창을 엽니다"));
+        openBtn.onClick = [this] { if (onOpenUpmixerWindow) onOpenUpmixerWindow(); };
+        addAndMakeVisible (openBtn);
+
+        useBtn.setTooltip (tr ("켜면: 호스트 채널 1~2 \xe2\x86\x92 업믹서 \xe2\x86\x92 Ch 1~12 / 끄면: 호스트 채널 1~12를 그대로 사용"));
+        useBtn.onClick = [this] { proc.setUpmixerEnabled (! proc.getUpmixer().isEnabled()); };
+        addAndMakeVisible (useBtn);
     }
 
-    static constexpr int kRowY0 = 114, kRowH = 36;
+    std::function<void()> onOpenUpmixerWindow;
+
+    static constexpr int kRowY0 = 114, kRowH = 35;
 
     void resized() override
     {
@@ -417,6 +458,10 @@ public:
             noiseBtn[(size_t) i].setBounds (230, y + 4, 30, 28);
             muteBtn[(size_t) i].setBounds (272, y + 4, 30, 28);
         }
+        const int uy = kRowY0 + kNumChannels * kRowH + 8;
+        pickBtn.setBounds (18, uy, 118, 28);
+        openBtn.setBounds (142, uy, 78, 28);
+        useBtn.setBounds (226, uy, 70, 28);
     }
 
     void refresh()
@@ -451,6 +496,17 @@ public:
         setBorder (allMuteBtn, all ? col::muteBdr : col::btnBorder);
         allMuteBtn.repaint();
         for (auto& mb : muteBtn) mb.repaint();
+
+        const auto& up = proc.getUpmixer();
+        const bool loaded = up.getInfo().loaded;
+        const bool on = loaded && up.isEnabled();
+        openBtn.setEnabled (loaded);
+        useBtn.setEnabled (loaded);
+        useBtn.setButtonText (on ? tr ("사용 중") : tr ("꺼짐"));
+        useBtn.setColour (juce::TextButton::buttonColourId, on ? col::neon.withAlpha (0.16f) : col::btn);
+        useBtn.setColour (juce::TextButton::textColourOffId, on ? col::neon : col::dim);
+        setBorder (useBtn, on ? col::neon : col::btnBorder);
+        useBtn.repaint();
         repaint();
     }
 
@@ -529,10 +585,83 @@ public:
             g.drawText (dbText (rms[(size_t) i]), 374, y, 48, kRowH, juce::Justification::centredRight);
         }
 
-        g.setColour (col::sub);
-        g.setFont (uiFont (13.5f));
-        g.drawText (tr ("핑크 노이즈 -20 dBFS RMS (LFE는 120 Hz 이하) · 테스트 중에는 음악이 잠시 멈춥니다"),
-                    18, kRowY0 + kNumChannels * kRowH + 14, 404, 32, juce::Justification::topLeft, true);
+        // Built-in upmixer status
+        const int uy = kRowY0 + kNumChannels * kRowH;
+        g.setColour (juce::Colour (0xff1f2529));
+        g.drawHorizontalLine (uy, 18.0f, 422.0f);
+        const auto& info = proc.getUpmixer().getInfo();
+        g.setFont (uiFont (14.0f, true));
+        g.setColour (info.loaded ? col::text : col::sub);
+        g.drawText (info.loaded ? info.name : tr ("업믹서 없음"), 302, uy + 8, 120, 28, juce::Justification::centredLeft, true);
+
+        juce::String detail;
+        juce::Colour detailCol = col::sub;
+        if (info.error.isNotEmpty())
+        {
+            detail = info.error;
+            detailCol = col::amber;
+        }
+        else if (info.loaded)
+        {
+            detail = info.layout + tr (" \xc2\xb7 지연 ") + juce::String (1000.0 * info.latencySamples / juce::jmax (1.0, proc.getHostSampleRate()), 1) + " ms"
+                   + (info.namedLayout ? tr (" \xc2\xb7 채널 순서 자동") : tr (" \xc2\xb7 번호 직접 지정"));
+            if (! proc.getUpmixer().isEnabled()) detail = tr ("꺼짐 \xc2\xb7 ") + detail;
+        }
+        else
+        {
+            detail = tr ("호스트 채널 1~12를 그대로 사용합니다");
+        }
+        g.setColour (detailCol);
+        g.setFont (uiFont (13.0f));
+        g.drawText (detail, 18, uy + 40, 404, 20, juce::Justification::centredLeft, true);
+    }
+
+    void showUpmixerMenu()
+    {
+        installed = UpmixerHost::findInstalledVst3();
+        juce::PopupMenu m;
+        m.addSectionHeader (tr ("설치된 VST3"));
+        for (int i = 0; i < installed.size(); ++i)
+            m.addItem (i + 1, installed[i].getFileNameWithoutExtension(), true,
+                       installed[i].getFullPathName() == proc.getUpmixer().getInfo().path);
+        if (installed.isEmpty())
+            m.addItem (-1, tr ("(VST3 폴더에서 찾지 못함)"), false);
+        m.addSeparator();
+        m.addItem (1000, tr ("다른 위치에서 찾기\xe2\x80\xa6"));
+        if (proc.getUpmixer().getInfo().loaded)
+            m.addItem (1001, tr ("업믹서 제거"));
+
+        juce::Component::SafePointer<MapPanel> safe (this);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pickBtn), [safe] (int r)
+        {
+            if (safe == nullptr || r <= 0) return;
+            if (r == 1001) { safe->proc.unloadUpmixer(); return; }
+            if (r == 1000) { safe->browseForUpmixer(); return; }
+            if (r - 1 < safe->installed.size()) safe->loadFrom (safe->installed[r - 1]);
+        });
+    }
+
+    void browseForUpmixer()
+    {
+        chooser = std::make_unique<juce::FileChooser> (tr ("업믹서 VST3 선택"),
+                                                       juce::File ("C:\\Program Files\\Common Files\\VST3"), "*.vst3");
+        juce::Component::SafePointer<MapPanel> safe (this);
+        chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
+                                  | juce::FileBrowserComponent::canSelectDirectories,
+                              [safe] (const juce::FileChooser& fc)
+                              {
+                                  if (safe == nullptr) return;
+                                  const auto f = fc.getResult();
+                                  if (f != juce::File()) safe->loadFrom (f);
+                              });
+    }
+
+    void loadFrom (const juce::File& f)
+    {
+        juce::MouseCursor::showWaitCursor();
+        const bool ok = proc.loadUpmixer (f.getFullPathName());
+        juce::MouseCursor::hideWaitCursor();
+        if (ok && onOpenUpmixerWindow) onOpenUpmixerWindow();
     }
 
 private:
@@ -540,8 +669,10 @@ private:
     std::array<juce::ComboBox, kNumChannels> numBox;
     std::array<NoiseButton, kNumChannels> noiseBtn;
     std::array<juce::TextButton, kNumChannels> muteBtn;
-    juce::TextButton resetBtn, allMuteBtn;
+    juce::TextButton resetBtn, allMuteBtn, pickBtn, openBtn, useBtn;
     std::array<float, kNumChannels> rms {};
+    juce::Array<juce::File> installed;
+    std::unique_ptr<juce::FileChooser> chooser;
 };
 
 //==============================================================================
@@ -564,6 +695,9 @@ public:
     {
         addAndMakeVisible (room);
         addAndMakeVisible (map);
+
+        map.onOpenUpmixerWindow = [this] { openUpmixerWindow(); };
+        proc.getUpmixer().beforeUnload = [this] { upmixerWindow.reset(); };
 
         static const char* modeNames[kNumModes] = { "음악", "저지연", "초저지연" };
         static const char* modeTips[kNumModes] = {
@@ -600,6 +734,26 @@ public:
         addAndMakeVisible (stopBtn);
 
         setSize (kBaseWidth, kBaseHeight);
+    }
+
+    ~RootView() override
+    {
+        proc.getUpmixer().beforeUnload = nullptr;
+        upmixerWindow.reset();
+    }
+
+    void openUpmixerWindow()
+    {
+        if (upmixerWindow != nullptr) { upmixerWindow->toFront (true); return; }
+        if (auto* inst = proc.getUpmixer().getInstance())
+        {
+            juce::Component::SafePointer<RootView> safe (this);
+            upmixerWindow = std::make_unique<HostedPluginWindow> (*inst, [safe]
+            {
+                // Deleting the window from inside its own callback: defer to the next message.
+                juce::MessageManager::callAsync ([safe] { if (safe != nullptr) safe->upmixerWindow.reset(); });
+            });
+        }
     }
 
     void resized() override
@@ -789,7 +943,8 @@ private:
             modeText = tr (modeNames[mode]) + tr (" \xc2\xb7 여유 버퍼 ") + juce::String (juce::roundToInt (s->feeder.getMarginMs()))
                      + tr (" ms \xc2\xb7 플러그인 지연 ")
                      + (running && s->feeder.getState() == OutputFeeder::State::Running
-                            ? juce::String (s->feeder.getLatencyMs(), 1) + " ms" : juce::String ("-- ms"));
+                            ? juce::String (s->feeder.getLatencyMs() + proc.getUpmixerLatencyMs(), 1) + " ms" : juce::String ("-- ms"))
+                     + (proc.getUpmixerLatencyMs() > 0.0 ? tr (" (업믹서 포함)") : juce::String());
             dropouts = (int) s->feeder.getDropouts();
 
             const float drift = std::abs (s->feeder.getDriftPpm());
@@ -855,6 +1010,8 @@ private:
     juce::TextButton seqBtn, stopBtn;
     TipArea statusTip;
     juce::String lastTip;
+
+    std::unique_ptr<HostedPluginWindow> upmixerWindow;
 
     juce::Colour statusColour { col::sub }, clockColour { col::sub };
     juce::String statusText, rateText { tr ("48 kHz \xc2\xb7 12ch") }, modeText, testText, clockText;

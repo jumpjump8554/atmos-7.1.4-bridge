@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.22)
 
-project (AtmosBridge VERSION 1.0.0 LANGUAGES C CXX)
+project (AtmosBridge VERSION 1.1.0 LANGUAGES C CXX)
 
 set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,6 +36,7 @@ juce_generate_juce_header (AtmosBridge)
 target_sources (AtmosBridge PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
+    Source/UpmixerHost.cpp
     Source/engine/SpatialEngine.cpp
     Source/engine/Platform.cpp)
 
@@ -45,7 +46,8 @@ target_compile_definitions (AtmosBridge PUBLIC
     DONT_SET_USING_JUCE_NAMESPACE=1
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
-    JUCE_VST3_CAN_REPLACE_VST2=0)
+    JUCE_VST3_CAN_REPLACE_VST2=0
+    JUCE_PLUGINHOST_VST3=1)   # built-in upmixer slot hosts a VST3 upmixer
 
 target_link_libraries (AtmosBridge
     PRIVATE

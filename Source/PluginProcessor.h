@@ -5,6 +5,7 @@
 #include "dsp/Dsp.h"
 #include "dsp/OutputFeeder.h"
 #include "engine/SpatialEngine.h"
+#include "UpmixerHost.h"
 
 #include <array>
 #include <atomic>
@@ -20,7 +21,8 @@ struct SharedOutput
 
 //==============================================================================
 class AtmosBridgeProcessor final : public juce::AudioProcessor,
-                                   private juce::Timer
+                                   private juce::Timer,
+                                   private juce::AsyncUpdater
 {
 public:
     AtmosBridgeProcessor();
@@ -93,6 +95,13 @@ public:
     float getUiScale() const noexcept { return uiScale; }
     void setUiScale (float s);
 
+    // Built-in upmixer slot (message thread)
+    UpmixerHost& getUpmixer() noexcept { return upmixer; }
+    bool loadUpmixer (const juce::String& path);   // user action: also resets the mapping for named layouts
+    void unloadUpmixer();
+    void setUpmixerEnabled (bool shouldBeEnabled);
+    double getUpmixerLatencyMs() const noexcept;
+
     bool isOutputOwner() const noexcept { return ownsOutput.load (std::memory_order_acquire); }
     SharedOutput* getSharedOutput() const noexcept { return isOutputOwner() ? shared.get() : nullptr; }
     double getHostSampleRate() const noexcept { return currentSampleRate; }
@@ -101,6 +110,8 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void timerCallback() override;
+    void handleAsyncUpdate() override;
+    void updateLatency();
     void tryClaimOutput();
     void releaseOutput();
     void updateChannelTable();
@@ -136,6 +147,10 @@ private:
     bool seqWasOn = false;
 
     std::array<std::atomic<float>, ab::kNumChannels> inRms, inPeak, posRms, posPeak;
+
+    UpmixerHost upmixer;
+    struct PendingUpmixer { bool valid = false; juce::String path, state; bool enabled = true; };
+    PendingUpmixer pendingUpmixer;   // restored state, applied on the message thread
 
     juce::String outputDeviceId;
     float uiScale = 0.9f;
