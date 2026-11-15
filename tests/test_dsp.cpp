@@ -107,7 +107,7 @@ static int modeSwitchTest()
     int fails = 0;
     double t = 0;
     const int modes[4] = { 0, 2, 1, 0 };
-    const double expect[4] = { 135, 38, 56, 135 };
+    const double expect[4] = { 130, 35, 38, 130 }; // true plugin latency (v1.2 margins: 100 / 4.5 / 8 ms)
     for (int phase = 0; phase < 4; ++phase)
     {
         f.setMode (modes[phase]);
@@ -123,6 +123,52 @@ static int modeSwitchTest()
         if (! ok) ++fails;
     }
     if (f.getDropouts() != 0) { std::printf ("mode switch dropouts FAIL\n"); ++fails; }
+    return fails;
+}
+
+// Clipping prevention: linked, zero latency, never above the ceiling, untouched below it, recovers.
+static int limiterTest()
+{
+    int fails = 0;
+    LinkedLimiter lim;
+    lim.prepare (48000.0, -1.0f);
+    const float ceil = lim.getCeiling();
+    const int n = 48000;
+    std::vector<std::vector<float>> ch (12, std::vector<float> (n, 0.0f));
+    std::vector<float*> p (12);
+    for (int c = 0; c < 12; ++c) p[c] = ch[c].data();
+
+    // 1) quiet signal (peak 0.5): bit-exact pass-through
+    for (int i = 0; i < n; ++i) { ch[0][i] = 0.5f * (float) std::sin (i * 0.05); ch[5][i] = 0.3f * (float) std::sin (i * 0.031); }
+    const auto ref0 = ch[0], ref5 = ch[5];
+    float g = 1.0f;
+    for (int off = 0; off < n; off += 480) { float* q[12]; for (int c = 0; c < 12; ++c) q[c] = p[c] + off; g = std::min (g, lim.process (q, 12, 480)); }
+    const bool untouched = ch[0] == ref0 && ch[5] == ref5 && g == 1.0f;
+    std::printf ("limiter: quiet signal untouched %s\n", untouched ? "OK" : "FAIL");
+    if (! untouched) ++fails;
+
+    // 2) hot signal (+6 dBFS on ch 0) with a quieter ch 7: never above -1 dBFS, balance kept
+    for (int i = 0; i < n; ++i) { ch[0][i] = 2.0f * (float) std::sin (i * 0.013); ch[7][i] = 0.5f * (float) std::sin (i * 0.013); }
+    for (int off = 0; off < n; off += 480) { float* q[12]; for (int c = 0; c < 12; ++c) q[c] = p[c] + off; lim.process (q, 12, 480); }
+    float peak = 0.0f, worstRatio = 0.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        peak = std::max (peak, std::abs (ch[0][i]));
+        if (std::abs (ch[0][i]) > 0.05f) worstRatio = std::max (worstRatio, std::abs (ch[7][i] / ch[0][i] - 0.25f));
+    }
+    const bool capped = peak <= ceil + 1e-6f && peak > ceil * 0.99f;
+    std::printf ("limiter: +6 dBFS input -> peak %.4f (ceiling %.4f) %s, linked ratio error %.5f %s\n",
+                 peak, ceil, capped ? "OK" : "FAIL", worstRatio, worstRatio < 1e-5f ? "OK" : "FAIL");
+    if (! capped) ++fails;
+    if (worstRatio >= 1e-5f) ++fails;
+
+    // 3) back to a quiet signal: the gain recovers to 1 within a second (80 ms release)
+    for (auto& c : ch) std::fill (c.begin(), c.end(), 0.0f);
+    for (int i = 0; i < n; ++i) ch[0][i] = 0.5f * (float) std::sin (i * 0.05);
+    for (int off = 0; off < n; off += 480) { float* q[12]; for (int c = 0; c < 12; ++c) q[c] = p[c] + off; lim.process (q, 12, 480); }
+    const bool recovered = lim.getGain() == 1.0f;
+    std::printf ("limiter: gain after 1 s of quiet audio %.5f %s\n", lim.getGain(), recovered ? "OK" : "FAIL");
+    if (! recovered) ++fails;
     return fails;
 }
 
@@ -175,6 +221,7 @@ int main()
     }
 
     fails += modeSwitchTest();
+    fails += limiterTest();
 
     std::printf (fails ? "\n%d FAILED\n" : "\nALL OK\n", fails);
     return fails;

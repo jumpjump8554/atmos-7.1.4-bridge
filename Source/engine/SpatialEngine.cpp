@@ -540,7 +540,12 @@ struct SpatialEngine::Impl
         const HRESULT coHr = CoInitializeEx (nullptr, COINIT_MULTITHREADED);
         DWORD taskIndex = 0;
         HANDLE avrt = AvSetMmThreadCharacteristicsW (L"Pro Audio", &taskIndex);
-        logLine (avrt ? "Output thread registered with MMCSS 'Pro Audio'" : "MMCSS registration failed");
+        // Highest MMCSS priority inside the "Pro Audio" task (the output thread does very little work,
+        // so this costs nothing but keeps it ahead of other audio threads when the CPU is busy).
+        const bool critical = avrt != nullptr && AvSetMmThreadPriority (avrt, AVRT_PRIORITY_CRITICAL);
+        logLine (avrt ? (critical ? "Output thread registered with MMCSS 'Pro Audio' (priority: critical)"
+                                  : "Output thread registered with MMCSS 'Pro Audio' (critical priority refused)")
+                      : "MMCSS registration failed");
         lockMemory();
 
         HRESULT hr = CoCreateInstance (__uuidof (MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof (IMMDeviceEnumerator), (void**) enumerator.ReleaseAndGetAddressOf());

@@ -95,12 +95,38 @@ public:
     float getUiScale() const noexcept { return uiScale; }
     void setUiScale (float s);
 
-    // Built-in upmixer slot (message thread)
-    UpmixerHost& getUpmixer() noexcept { return upmixer; }
-    bool loadUpmixer (const juce::String& path);   // user action: also resets the mapping for named layouts
-    void unloadUpmixer();
-    void setUpmixerEnabled (bool shouldBeEnabled);
-    double getUpmixerLatencyMs() const noexcept;
+    // Clipping prevention (-1.0 dBFS, 12 channels linked, zero latency)
+    bool isLimiterOn() const noexcept { return limiterParam->load() > 0.5f; }
+    void setLimiterOn (bool on);
+    float getLimiterGainDb() const noexcept { return limGainDb.load (std::memory_order_relaxed); }
+
+    // Theme preset. The last chosen theme is also remembered for the whole PC user
+    // (%APPDATA%\Atmos Bridge 7.1.4ch), so every new window opens with it.
+    ab::ThemeId getTheme() const noexcept { return theme; }
+    void setTheme (ab::ThemeId t);
+
+    //========================================================================== upmixer slots (message thread)
+    // Up to 4 VST3 upmixers. One of them (or none) is "on" (O); its output replaces the host channels.
+    // B = bypass (the slot stays selected but host channels 1..12 pass straight through).
+    // Every slot (and "no upmixer") remembers its own channel number table.
+    struct SlotView
+    {
+        juce::String name, path, layout, error;
+        bool loaded = false, namedLayout = false, bypass = false, active = false;
+        double latencyMs = 0.0;
+    };
+    int getNumSlots() const noexcept { return (int) slots.size(); }
+    SlotView getSlot (int index) const;
+    int getActiveSlot() const noexcept { return activeSlot; }
+    bool addUpmixer (const juce::String& path, juce::String& error); // new slot, switched on; false = not added
+    void removeSlot (int index);
+    void toggleSlotActive (int index);
+    void toggleSlotBypass (int index);
+    int getSlotHostIndex (int index) const noexcept;
+    UpmixerHost& getHost (int hostIndex) noexcept { return *hosts[(size_t) hostIndex]; }
+    juce::AudioPluginInstance* getSlotInstance (int index) const noexcept;
+    double getUpmixerLatencyMs() const noexcept;    // latency of the upmixer that is running now
+    int getSlotsVersion() const noexcept { return slotsVersion; } // changes whenever the slot list changes
 
     bool isOutputOwner() const noexcept { return ownsOutput.load (std::memory_order_acquire); }
     SharedOutput* getSharedOutput() const noexcept { return isOutputOwner() ? shared.get() : nullptr; }
@@ -120,6 +146,18 @@ private:
     void processChunk (juce::AudioBuffer<float>& buffer, int start, int num);
     void setParam (const juce::String& id, float plainValue);
 
+    using Map = std::array<int, ab::kNumChannels>;
+    static Map defaultMap() noexcept { Map m {}; for (int c = 0; c < ab::kNumChannels; ++c) m[(size_t) c] = c; return m; }
+    static juce::String mapToString (const Map& m);
+    static Map mapFromString (const juce::String& s, const Map& fallback);
+    Map liveMap() const noexcept;
+    void applyLiveMap (const Map& m) noexcept;
+    Map& activeMapMemory() noexcept;               // the table that belongs to the current choice
+    void setActiveSlot (int index);
+    void unloadAllSlots();
+    int findFreeHost() const noexcept;
+    void bumpSlots() noexcept { ++slotsVersion; }
+
     // Only one instance per process owns the HDMI output.
     static std::atomic<AtmosBridgeProcessor*> owner;
     static std::unique_ptr<SharedOutput> shared;
@@ -127,6 +165,7 @@ private:
 
     std::array<std::atomic<float>*, ab::kNumChannels> muteParams {};
     std::atomic<float>* modeParam = nullptr;
+    std::atomic<float>* limiterParam = nullptr;
 
     std::array<std::atomic<int>, ab::kNumChannels> outMap;
     std::array<std::atomic<int>, ab::kMaxInputs> hostToJuce;   // host channel index -> JUCE buffer index
@@ -142,18 +181,37 @@ private:
     std::array<float*, ab::kNumChannels> inPtrs {}, posPtrs {};
     std::array<float, ab::kNumChannels> gainNow {}, inMeanSq {}, posMeanSq {};
     ab::NoiseTable noise;
+    ab::LinkedLimiter limiter;
+    bool limiterWasOn = true;
+    std::atomic<float> limGainDb { 0.0f };
     double seqSamples = 0.0;
     int seqIndex = 0;
     bool seqWasOn = false;
 
     std::array<std::atomic<float>, ab::kNumChannels> inRms, inPeak, posRms, posPeak;
 
-    UpmixerHost upmixer;
-    struct PendingUpmixer { bool valid = false; juce::String path, state; bool enabled = true; };
-    PendingUpmixer pendingUpmixer;   // restored state, applied on the message thread
+    // Upmixer slots. The hosts never move (the audio thread reads them through activeHost);
+    // "slots" is the list shown in the editor, in display order.
+    struct SlotEntry
+    {
+        int host = -1;
+        juce::String path, name, pendingState, error;
+        bool bypass = false;
+        Map map = defaultMap();
+    };
+    std::array<std::unique_ptr<UpmixerHost>, ab::kMaxUpmixers> hosts;
+    std::vector<SlotEntry> slots;
+    int activeSlot = -1;
+    Map directMap = defaultMap();                  // table used with no upmixer switched on
+    std::atomic<int> activeHost { -1 };
+    int slotsVersion = 0;
 
+    struct PendingRestore { bool valid = false; std::vector<SlotEntry> slots; int active = -1; Map direct = defaultMap(); };
+    PendingRestore pendingRestore;   // restored state, applied on the message thread
+
+    ab::ThemeId theme = ab::ThemeId::Cyberpunk;
     juce::String outputDeviceId;
-    float uiScale = 0.9f;
+    float uiScale = 0.75f;
     int statTick = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AtmosBridgeProcessor)

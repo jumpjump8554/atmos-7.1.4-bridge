@@ -25,9 +25,9 @@ public:
 
     // Safety margin on top of one host block + one output period, per latency mode.
     static constexpr double kMusicMarginMs   = 100.0;
-    static constexpr double kLowMarginMs     = 20.0;
+    static constexpr double kLowMarginMs     = 8.0;
     static constexpr double kLowMaxExtraMs   = 60.0;  // Low mode grows by 10 ms per dropout, up to +60 ms
-    static constexpr double kUltraMarginMs   = 3.0;
+    static constexpr double kUltraMarginMs   = 4.5;
 
     explicit OutputFeeder (int numChannels) : numCh (numChannels)
     {
@@ -227,8 +227,10 @@ public:
         }
         resampler.process (out, numOut, ratio);
 
-        // Plugin-side latency: half a host block (block delivery) + queued audio + one output period.
-        const double latency = 1000.0 * (0.5 * (double) blk / hr + smoothFill / hr + (double) numOut / outRate);
+        // Plugin-side latency (what an impulse actually takes, measured in simulation):
+        // every sample waits one host block plus the real queue in front of it; the "virtual" fill already
+        // counts half a block on average, so: smoothed virtual fill + one output period.
+        const double latency = 1000.0 * (smoothFill / hr + (double) numOut / outRate);
         latencyMs.store ((float) latency, std::memory_order_relaxed);
         driftPpm.store ((float) (correction * 1e6), std::memory_order_relaxed);
     }

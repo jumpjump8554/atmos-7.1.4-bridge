@@ -144,4 +144,61 @@ private:
     std::vector<float> full, lfe;
     int length = 0, pos = 0;
 };
+
+// Clipping prevention: 12-channel linked peak limiter with zero latency (no look-ahead).
+//  - the gain is computed from the loudest channel, and the same gain is applied to every channel,
+//    so the balance between the speakers never changes
+//  - a sample that would exceed the ceiling gets exactly the gain that puts it on the ceiling
+//    (instant attack), then the gain holds for 5 ms and recovers smoothly (80 ms release)
+class LinkedLimiter
+{
+public:
+    void prepare (double sampleRate, float ceilingDb = -1.0f) noexcept
+    {
+        ceiling = std::pow (10.0f, ceilingDb / 20.0f);
+        holdSamples = std::max (1, (int) (0.005 * sampleRate));
+        release = (float) std::exp (-1.0 / (0.080 * sampleRate));
+        reset();
+    }
+
+    void reset() noexcept { atten = 0.0f; hold = 0; }
+
+    float getCeiling() const noexcept { return ceiling; }
+    float getGain() const noexcept { return 1.0f - atten; }
+
+    // Processes numCh channels in place; returns the lowest gain used in this block (1 = untouched).
+    // The state is the attenuation (1 - gain): near unity gain a float cannot represent the tiny
+    // release steps of the gain itself, but it can represent them for the attenuation.
+    float process (float* const* ch, int numCh, int n) noexcept
+    {
+        float minGain = 1.0f;
+        for (int k = 0; k < n; ++k)
+        {
+            float peak = 0.0f;
+            for (int c = 0; c < numCh; ++c)
+                peak = std::max (peak, std::abs (ch[c][k]));
+
+            const float need = peak > ceiling ? ceiling / peak : 1.0f;
+            const float needAtten = 1.0f - need;
+            if (needAtten > atten)  { atten = needAtten; hold = holdSamples; }
+            else if (hold > 0)      { --hold; }
+            else if (atten > 0.0f)
+            {
+                atten = std::max (needAtten, atten * release);
+                if (atten < 1.0e-5f) atten = 0.0f; // -0.0001 dB: done
+            }
+
+            const float g = std::min (need, 1.0f - atten); // never above the ceiling
+            if (g < 1.0f)
+                for (int c = 0; c < numCh; ++c)
+                    ch[c][k] *= g;
+            minGain = std::min (minGain, g);
+        }
+        return minGain;
+    }
+
+private:
+    float ceiling = 0.891251f, atten = 0.0f, release = 0.9997f;
+    int holdSamples = 240, hold = 0;
+};
 } // namespace ab

@@ -8,6 +8,37 @@ using namespace ab;
 std::atomic<AtmosBridgeProcessor*> AtmosBridgeProcessor::owner { nullptr };
 std::unique_ptr<SharedOutput> AtmosBridgeProcessor::shared;
 
+namespace
+{
+// Per-user settings file: %APPDATA%/Atmos Bridge 7.1.4ch/AtmosBridge.settings
+// (the file name must not contain the product name: its ".4ch" would be taken as the extension)
+juce::PropertiesFile::Options userSettingsOptions()
+{
+    juce::PropertiesFile::Options o;
+    o.applicationName = "AtmosBridge";
+    o.folderName = JucePlugin_Name;
+    o.filenameSuffix = ".settings";
+    o.osxLibrarySubFolder = "Application Support";
+    o.commonToAllUsers = false;
+    return o;
+}
+
+int readUserTheme()
+{
+    juce::PropertiesFile f (userSettingsOptions());
+    const int t = f.getIntValue ("theme", -1);
+    return (t >= 0 && t < kNumThemes) ? t : -1;
+}
+
+void writeUserTheme (int t)
+{
+    juce::PropertiesFile f (userSettingsOptions());
+    f.setValue ("theme", t);
+    if (! f.saveIfNeeded())
+        logLine ("Could not save the theme to " + f.getFile().getFullPathName().toStdString());
+}
+} // namespace
+
 //==============================================================================
 juce::AudioProcessorValueTreeState::ParameterLayout AtmosBridgeProcessor::createLayout()
 {
@@ -20,7 +51,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AtmosBridgeProcessor::create
 
     layout.add (std::make_unique<juce::AudioParameterChoice> (
         ParameterID { "mode", 1 }, "Latency Mode",
-        juce::StringArray { "Music", "Low latency", "Ultra low latency" }, 0));
+        juce::StringArray { "Default", "Low latency", "Ultra low latency" }, 0));
+    layout.add (std::make_unique<juce::AudioParameterBool> (ParameterID { "limiter", 2 }, "Clipping Prevention", true));
     return layout;
 }
 
@@ -41,6 +73,11 @@ AtmosBridgeProcessor::AtmosBridgeProcessor()
         posPeak[(size_t) c].store (0.0f);
     }
     modeParam = apvts.getRawParameterValue ("mode");
+    limiterParam = apvts.getRawParameterValue ("limiter");
+    for (auto& h : hosts) h = std::make_unique<UpmixerHost>();
+
+    const int userTheme = readUserTheme();
+    if (userTheme >= 0) theme = (ThemeId) userTheme;
 
     for (int i = 0; i < kMaxInputs; ++i) hostToJuce[(size_t) i].store (i);
     updateChannelTable();
@@ -54,7 +91,8 @@ AtmosBridgeProcessor::~AtmosBridgeProcessor()
 {
     stopTimer();
     cancelPendingUpdate();
-    upmixer.unload();
+    activeHost.store (-1);
+    for (auto& h : hosts) { h->beforeUnload = nullptr; h->unload(); }
     releaseOutput();
 }
 
@@ -93,8 +131,9 @@ void AtmosBridgeProcessor::timerCallback()
     if (owner.load() == nullptr)
         tryClaimOutput();
 
-    if (upmixer.refreshLatency())
-        updateLatency();
+    bool latencyChanged = false;
+    for (auto& h : hosts) latencyChanged = h->refreshLatency() || latencyChanged;
+    if (latencyChanged) updateLatency();
 
     // Every 5 s while audio is flowing: one diagnostics line in the log.
     if (auto* s = getSharedOutput())
@@ -134,7 +173,8 @@ void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
         posMeanSq[(size_t) c] = 0.0f;
     }
 
-    upmixer.prepare (currentSampleRate, chunk);
+    for (auto& h : hosts) h->prepare (currentSampleRate, chunk);
+    limiter.prepare (currentSampleRate, kLimiterCeilingDb);
     updateLatency();
 
     // Pink noise is generated here, once (4 s loop), so the audio thread only copies it.
@@ -223,7 +263,8 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
     const bool testActive = iNoise >= 0 || pNoise >= 0;
 
     // 1) Inputs (program audio is silenced while a test signal plays)
-    //    - built-in upmixer active: host channels 1-2 -> upmixer -> inputs 1..12 (L R C LFE SBL SBR SL SR TFL TFR TRL TRR)
+    //    - an upmixer slot is on (and not bypassed): host channels 1-2 -> upmixer -> inputs 1..12
+    //      (L R C LFE SBL SBR SL SR TFL TFR TRL TRR)
     //    - otherwise: host channel n -> input n
     if (testActive)
     {
@@ -236,14 +277,14 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
                 juce::FloatVectorOperations::clear (dst, n);
         }
     }
-    else if (upmixer.isActive())
+    else if (const int ah = activeHost.load (std::memory_order_acquire); ah >= 0 && hosts[(size_t) ah]->isActive())
     {
         auto hostPtr = [&] (int i) -> const float*
         {
             const int src = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
             return (src >= 0 && src < numIn) ? buffer.getReadPointer (src, start) : nullptr;
         };
-        if (! upmixer.process (hostPtr (0), hostPtr (1), inPtrs.data(), n))
+        if (! hosts[(size_t) ah]->process (hostPtr (0), hostPtr (1), inPtrs.data(), n))
             for (int i = 0; i < kNumChannels; ++i)
                 juce::FloatVectorOperations::clear (inPtrs[(size_t) i], n); // upmixer being swapped
     }
@@ -299,7 +340,21 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
     }
     noise.advance (n);
 
-    // 5) Meters (~80 ms RMS)
+    // 5) Clipping prevention: -1.0 dBFS, one gain for all 12 positions, no look-ahead (0 ms)
+    const bool limOn = limiterParam->load (std::memory_order_relaxed) > 0.5f;
+    if (limOn)
+    {
+        if (! limiterWasOn) limiter.reset();
+        const float gMin = limiter.process (posPtrs.data(), kNumChannels, n);
+        limGainDb.store (gMin < 1.0f ? 20.0f * std::log10 (gMin) : 0.0f, std::memory_order_relaxed);
+    }
+    else
+    {
+        limGainDb.store (0.0f, std::memory_order_relaxed);
+    }
+    limiterWasOn = limOn;
+
+    // 6) Meters (~80 ms RMS)
     const float a = (float) std::exp (-(double) n / (0.08 * sr));
     auto meter = [n, a] (const float* d, float& meanSq, std::atomic<float>& rms, std::atomic<float>& peak)
     {
@@ -316,7 +371,7 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
         meter (posPtrs[(size_t) c], posMeanSq[(size_t) c], posRms[(size_t) c], posPeak[(size_t) c]);
     }
 
-    // 6) Hand over to the spatial output thread (not while rendering offline)
+    // 7) Hand over to the spatial output thread (not while rendering offline)
     if (ownsOutput.load (std::memory_order_acquire) && ! isNonRealtime())
     {
         shared->feeder.setMode ((int) getMode());
@@ -346,16 +401,53 @@ void AtmosBridgeProcessor::setParam (const juce::String& id, float plainValue)
     }
 }
 
+juce::String AtmosBridgeProcessor::mapToString (const Map& m)
+{
+    juce::StringArray a;
+    for (int v : m) a.add (juce::String (v + 1)); // 1..12, 0 = off
+    return a.joinIntoString (",");
+}
+
+AtmosBridgeProcessor::Map AtmosBridgeProcessor::mapFromString (const juce::String& text, const Map& fallback)
+{
+    const auto t = juce::StringArray::fromTokens (text, ",", "");
+    if (t.size() != kNumChannels) return fallback;
+    Map m {};
+    for (int c = 0; c < kNumChannels; ++c) m[(size_t) c] = juce::jlimit (-1, kNumChannels - 1, t[c].getIntValue() - 1);
+    return m;
+}
+
+AtmosBridgeProcessor::Map AtmosBridgeProcessor::liveMap() const noexcept
+{
+    Map m {};
+    for (int c = 0; c < kNumChannels; ++c) m[(size_t) c] = outMap[(size_t) c].load();
+    return m;
+}
+
+void AtmosBridgeProcessor::applyLiveMap (const Map& m) noexcept
+{
+    for (int c = 0; c < kNumChannels; ++c) outMap[(size_t) c].store (m[(size_t) c]);
+}
+
+AtmosBridgeProcessor::Map& AtmosBridgeProcessor::activeMapMemory() noexcept
+{
+    if (activeSlot >= 0 && activeSlot < (int) slots.size()) return slots[(size_t) activeSlot].map;
+    return directMap;
+}
+
 void AtmosBridgeProcessor::setPosition (int input, int position)
 {
     if (input < 0 || input >= kNumChannels) return;
-    outMap[(size_t) input].store (juce::jlimit (-1, kNumChannels - 1, position));
+    const int p = juce::jlimit (-1, kNumChannels - 1, position);
+    outMap[(size_t) input].store (p);
+    activeMapMemory()[(size_t) input] = p;
     writeExtrasToState();
 }
 
 void AtmosBridgeProcessor::resetMapping()
 {
-    for (int c = 0; c < kNumChannels; ++c) outMap[(size_t) c].store (c);
+    activeMapMemory() = defaultMap();
+    applyLiveMap (defaultMap());
     writeExtrasToState();
     logLine ("Mapping reset to default");
 }
@@ -431,97 +523,300 @@ void AtmosBridgeProcessor::setUiScale (float s)
     writeExtrasToState();
 }
 
-//==============================================================================
-bool AtmosBridgeProcessor::loadUpmixer (const juce::String& path)
+void AtmosBridgeProcessor::setLimiterOn (bool on)
 {
-    pendingUpmixer.valid = false;
-    if (! upmixer.load (path)) return false;
-    upmixer.setEnabled (true);
-    if (upmixer.getInfo().namedLayout)
-        resetMapping(); // channels already arrive in L R C LFE SBL SBR SL SR TFL TFR TRL TRR order
+    setParam ("limiter", on ? 1.0f : 0.0f);
+    logLine (std::string ("Clipping prevention ") + (on ? "on" : "off"));
+}
+
+void AtmosBridgeProcessor::setTheme (ThemeId t)
+{
+    theme = t;
     writeExtrasToState();
-    updateLatency();
+    writeUserTheme ((int) t);
+    logLine ("Theme: " + std::to_string ((int) t));
+}
+
+//============================================================================== upmixer slots
+int AtmosBridgeProcessor::findFreeHost() const noexcept
+{
+    for (int h = 0; h < kMaxUpmixers; ++h)
+    {
+        bool used = false;
+        for (const auto& e : slots) used = used || e.host == h;
+        if (! used) return h;
+    }
+    return -1;
+}
+
+int AtmosBridgeProcessor::getSlotHostIndex (int index) const noexcept
+{
+    return (index >= 0 && index < (int) slots.size()) ? slots[(size_t) index].host : -1;
+}
+
+juce::AudioPluginInstance* AtmosBridgeProcessor::getSlotInstance (int index) const noexcept
+{
+    const int h = getSlotHostIndex (index);
+    return h >= 0 ? hosts[(size_t) h]->getInstance() : nullptr;
+}
+
+AtmosBridgeProcessor::SlotView AtmosBridgeProcessor::getSlot (int index) const
+{
+    SlotView v;
+    if (index < 0 || index >= (int) slots.size()) return v;
+    const auto& e = slots[(size_t) index];
+    const auto& info = hosts[(size_t) e.host]->getInfo();
+    v.loaded = info.loaded;
+    v.name = info.loaded ? info.name : (e.name.isNotEmpty() ? e.name : juce::File (e.path).getFileNameWithoutExtension());
+    v.path = e.path;
+    v.layout = info.layout;
+    v.namedLayout = info.namedLayout;
+    v.error = info.loaded ? juce::String() : (e.error.isNotEmpty() ? e.error : info.error);
+    v.bypass = e.bypass;
+    v.active = index == activeSlot;
+    v.latencyMs = info.loaded ? 1000.0 * info.latencySamples / juce::jmax (1.0, currentSampleRate) : 0.0;
+    return v;
+}
+
+bool AtmosBridgeProcessor::addUpmixer (const juce::String& path, juce::String& error)
+{
+    error.clear();
+    if ((int) slots.size() >= kMaxUpmixers)
+    {
+        error = juce::String::fromUTF8 ("업믹서는 최대 4개까지 추가할 수 있습니다");
+        return false;
+    }
+    const int h = findFreeHost();
+    if (h < 0) return false;
+
+    auto& host = *hosts[(size_t) h];
+    if (! host.load (path))
+    {
+        error = host.getInfo().error;
+        return false;
+    }
+    host.setEnabled (true);
+
+    SlotEntry e;
+    e.host = h;
+    e.path = path;
+    e.name = host.getInfo().name;
+    e.map = defaultMap(); // named layouts arrive in L R C LFE SBL SBR SL SR TFL TFR TRL TRR order
+    slots.push_back (e);
+    bumpSlots();
+    logLine ("Upmixer slot added: " + e.name.toStdString());
+    setActiveSlot ((int) slots.size() - 1); // a new upmixer is switched on right away
     return true;
 }
 
-void AtmosBridgeProcessor::unloadUpmixer()
+void AtmosBridgeProcessor::removeSlot (int index)
 {
-    pendingUpmixer.valid = false;
-    upmixer.unload();
+    if (index < 0 || index >= (int) slots.size()) return;
+    if (index == activeSlot) setActiveSlot (-1);
+
+    const auto e = slots[(size_t) index];
+    slots.erase (slots.begin() + index);
+    if (activeSlot > index) --activeSlot;
+    hosts[(size_t) e.host]->unload();
+    bumpSlots();
     writeExtrasToState();
     updateLatency();
+    logLine ("Upmixer slot removed: " + e.name.toStdString());
 }
 
-void AtmosBridgeProcessor::setUpmixerEnabled (bool shouldBeEnabled)
+void AtmosBridgeProcessor::toggleSlotActive (int index)
 {
-    upmixer.setEnabled (shouldBeEnabled);
+    if (index < 0 || index >= (int) slots.size()) return;
+    setActiveSlot (index == activeSlot ? -1 : index);
+}
+
+void AtmosBridgeProcessor::setActiveSlot (int index)
+{
+    if (index >= (int) slots.size()) index = -1;
+
+    // Keep the table of the current choice, then switch to the table of the new one.
+    activeMapMemory() = liveMap();
+    activeSlot = index;
+
+    if (index >= 0)
+    {
+        auto& host = *hosts[(size_t) slots[(size_t) index].host];
+        host.resetPlugin();
+        activeHost.store (slots[(size_t) index].host, std::memory_order_release);
+    }
+    else
+    {
+        activeHost.store (-1, std::memory_order_release);
+    }
+    applyLiveMap (activeMapMemory());
+
+    bumpSlots();
     writeExtrasToState();
     updateLatency();
-    logLine (std::string ("Upmixer ") + (shouldBeEnabled ? "enabled" : "bypassed"));
+    logLine ("Upmixer on: " + (index >= 0 ? slots[(size_t) index].name.toStdString() : std::string ("<none>")));
+}
+
+void AtmosBridgeProcessor::toggleSlotBypass (int index)
+{
+    if (index < 0 || index >= (int) slots.size()) return;
+    auto& e = slots[(size_t) index];
+    e.bypass = ! e.bypass;
+    hosts[(size_t) e.host]->setEnabled (! e.bypass);
+    bumpSlots();
+    writeExtrasToState();
+    updateLatency();
+    logLine ("Upmixer " + e.name.toStdString() + (e.bypass ? ": bypass" : ": bypass off"));
+}
+
+void AtmosBridgeProcessor::unloadAllSlots()
+{
+    activeHost.store (-1, std::memory_order_release);
+    activeSlot = -1;
+    for (const auto& e : slots) hosts[(size_t) e.host]->unload();
+    slots.clear();
+    bumpSlots();
 }
 
 double AtmosBridgeProcessor::getUpmixerLatencyMs() const noexcept
 {
-    return upmixer.isActive() ? 1000.0 * upmixer.getInfo().latencySamples / currentSampleRate : 0.0;
+    const int h = activeHost.load();
+    if (h < 0 || ! hosts[(size_t) h]->isActive()) return 0.0;
+    return 1000.0 * hosts[(size_t) h]->getInfo().latencySamples / juce::jmax (1.0, currentSampleRate);
 }
 
 void AtmosBridgeProcessor::updateLatency()
 {
-    setLatencySamples (upmixer.isActive() ? upmixer.getInfo().latencySamples : 0);
+    const int h = activeHost.load();
+    setLatencySamples ((h >= 0 && hosts[(size_t) h]->isActive()) ? hosts[(size_t) h]->getInfo().latencySamples : 0);
 }
 
 void AtmosBridgeProcessor::handleAsyncUpdate()
 {
-    if (! pendingUpmixer.valid) return;
-    const auto p = pendingUpmixer;
-    pendingUpmixer.valid = false;
+    if (! pendingRestore.valid) return;
+    auto p = std::move (pendingRestore);
+    pendingRestore = {};
 
-    if (p.path.isEmpty())
+    unloadAllSlots();
+    for (auto& r : p.slots)
     {
-        upmixer.unload();
+        if ((int) slots.size() >= kMaxUpmixers) break;
+        SlotEntry e = r;
+        e.host = findFreeHost();
+        auto& host = *hosts[(size_t) e.host];
+        if (host.load (e.path))
+        {
+            host.setStateBase64 (r.pendingState);
+            e.pendingState.clear();
+            e.name = host.getInfo().name;
+            e.error.clear();
+        }
+        else
+        {
+            // Keep the entry (and its settings) so nothing is lost; the slot shows why it failed.
+            e.error = host.getInfo().error;
+            logLine ("Upmixer could not be restored: " + e.path.toStdString());
+        }
+        host.setEnabled (! e.bypass);
+        slots.push_back (e);
+    }
+    directMap = p.direct;
+    activeSlot = -1;
+    const Map restoredLive = liveMap();
+    const int want = (p.active >= 0 && p.active < (int) slots.size()) ? p.active : -1;
+    if (want >= 0)
+    {
+        activeSlot = want;
+        activeHost.store (slots[(size_t) want].host, std::memory_order_release);
+        slots[(size_t) want].map = restoredLive;
     }
     else
     {
-        if (! upmixer.getInfo().loaded || upmixer.getInfo().path != p.path)
-            upmixer.load (p.path);
-        if (upmixer.getInfo().loaded)
-            upmixer.setStateBase64 (p.state);
+        directMap = restoredLive;
     }
-    upmixer.setEnabled (p.enabled);
+    bumpSlots();
+    writeExtrasToState();
     updateLatency();
 }
 
 //==============================================================================
 void AtmosBridgeProcessor::writeExtrasToState()
 {
-    juce::StringArray map;
-    for (int c = 0; c < kNumChannels; ++c)
-        map.add (juce::String (outMap[(size_t) c].load() + 1)); // 1..12, 0 = off
-
     auto& s = apvts.state;
-    s.setProperty ("map", map.joinIntoString (","), nullptr);
+    s.setProperty ("map", mapToString (liveMap()), nullptr);
     s.setProperty ("outputDevice", outputDeviceId, nullptr);
     s.setProperty ("uiScale", uiScale, nullptr);
-    s.setProperty ("upmixerPath", upmixer.getInfo().loaded ? upmixer.getInfo().path
-                                                           : (pendingUpmixer.valid ? pendingUpmixer.path : juce::String()), nullptr);
-    s.setProperty ("upmixerEnabled", upmixer.isEnabled(), nullptr);
-    s.setProperty ("stateVersion", 2, nullptr);
+    s.setProperty ("theme", (int) theme, nullptr);
+    s.setProperty ("stateVersion", 3, nullptr);
+
+    // While a restore is still pending, the slots that are about to be loaded are what we save.
+    const bool pending = pendingRestore.valid;
+    const auto& list = pending ? pendingRestore.slots : slots;
+
+    juce::ValueTree ups ("UPMIXERS");
+    ups.setProperty ("active", pending ? pendingRestore.active : activeSlot, nullptr);
+    ups.setProperty ("directMap", mapToString (pending ? pendingRestore.direct
+                                                      : (activeSlot < 0 ? liveMap() : directMap)), nullptr);
+    for (int i = 0; i < (int) list.size(); ++i)
+    {
+        const auto& e = list[(size_t) i];
+        juce::ValueTree t ("SLOT");
+        t.setProperty ("path", e.path, nullptr);
+        t.setProperty ("name", e.name, nullptr);
+        t.setProperty ("bypass", e.bypass, nullptr);
+        t.setProperty ("map", mapToString ((! pending && i == activeSlot) ? liveMap() : e.map), nullptr);
+        ups.appendChild (t, nullptr);
+    }
+    if (auto old = s.getChildWithName ("UPMIXERS"); old.isValid()) s.removeChild (old, nullptr);
+    s.appendChild (ups, nullptr);
 }
 
 void AtmosBridgeProcessor::readExtrasFromState()
 {
     auto& s = apvts.state;
-    auto map = juce::StringArray::fromTokens (s.getProperty ("map", "").toString(), ",", "");
-    if (map.size() == kNumChannels)
-        for (int c = 0; c < kNumChannels; ++c)
-            outMap[(size_t) c].store (juce::jlimit (-1, kNumChannels - 1, map[c].getIntValue() - 1));
+    const Map live = mapFromString (s.getProperty ("map", "").toString(), liveMap());
+    applyLiveMap (live);
 
-    uiScale = juce::jlimit (0.5f, 1.5f, (float) s.getProperty ("uiScale", 0.9f));
+    uiScale = juce::jlimit (0.5f, 1.5f, (float) s.getProperty ("uiScale", uiScale));
 
-    pendingUpmixer.path = s.getProperty ("upmixerPath", "").toString();
-    pendingUpmixer.state = s.getProperty ("upmixerState", "").toString();
-    pendingUpmixer.enabled = (bool) s.getProperty ("upmixerEnabled", true);
-    pendingUpmixer.valid = true;
+    // Theme: the one last chosen on this PC wins; the project's own value is used when there is none.
+    const int userTheme = readUserTheme();
+    const int projectTheme = (int) s.getProperty ("theme", (int) theme);
+    theme = (ThemeId) juce::jlimit (0, kNumThemes - 1, userTheme >= 0 ? userTheme : projectTheme);
+
+    PendingRestore p;
+    p.valid = true;
+    p.direct = live;
+    const int version = (int) s.getProperty ("stateVersion", 1);
+    if (version >= 3)
+    {
+        const auto ups = s.getChildWithName ("UPMIXERS");
+        p.active = (int) ups.getProperty ("active", -1);
+        p.direct = mapFromString (ups.getProperty ("directMap", "").toString(), defaultMap());
+        for (int i = 0; i < ups.getNumChildren() && i < kMaxUpmixers; ++i)
+        {
+            const auto t = ups.getChild (i);
+            SlotEntry e;
+            e.path = t.getProperty ("path", "").toString();
+            e.name = t.getProperty ("name", "").toString();
+            e.pendingState = t.getProperty ("state", "").toString();
+            e.bypass = (bool) t.getProperty ("bypass", false);
+            e.map = mapFromString (t.getProperty ("map", "").toString(), defaultMap());
+            if (e.path.isNotEmpty()) p.slots.push_back (e);
+        }
+        if (p.active >= (int) p.slots.size()) p.active = -1;
+    }
+    else if (const auto path = s.getProperty ("upmixerPath", "").toString(); path.isNotEmpty())
+    {
+        // v1.1 project: one upmixer ("off" there = bypass here), same table as before.
+        SlotEntry e;
+        e.path = path;
+        e.pendingState = s.getProperty ("upmixerState", "").toString();
+        e.bypass = ! (bool) s.getProperty ("upmixerEnabled", true);
+        e.map = live;
+        p.slots.push_back (e);
+        p.active = 0;
+    }
+    pendingRestore = std::move (p);
     triggerAsyncUpdate(); // plugins must be loaded on the message thread
 
     const juce::String dev = s.getProperty ("outputDevice", "").toString();
@@ -536,9 +831,23 @@ void AtmosBridgeProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     writeExtrasToState();
     auto state = apvts.copyState();
-    // The hosted upmixer's own settings travel with ours.
-    state.setProperty ("upmixerState", upmixer.getInfo().loaded ? upmixer.getStateBase64()
-                                                               : (pendingUpmixer.valid ? pendingUpmixer.state : juce::String()), nullptr);
+    // Each hosted upmixer's own settings travel with ours.
+    auto ups = state.getChildWithName ("UPMIXERS");
+    const bool pending = pendingRestore.valid;
+    for (int i = 0; i < ups.getNumChildren(); ++i)
+    {
+        juce::String st;
+        if (pending)
+        {
+            if (i < (int) pendingRestore.slots.size()) st = pendingRestore.slots[(size_t) i].pendingState;
+        }
+        else if (i < (int) slots.size())
+        {
+            const auto& e = slots[(size_t) i];
+            st = hosts[(size_t) e.host]->getInfo().loaded ? hosts[(size_t) e.host]->getStateBase64() : e.pendingState;
+        }
+        ups.getChild (i).setProperty ("state", st, nullptr);
+    }
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }

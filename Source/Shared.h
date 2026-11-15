@@ -23,7 +23,14 @@ constexpr double kSequenceSeconds = 2.0; // time per position in the sequential 
 enum class LatencyMode : int { Music = 0, Low = 1, Ultra = 2 };
 constexpr int kNumModes = 3;
 
+constexpr float kLimiterCeilingDb = -1.0f; // clipping prevention ceiling (12 channels linked)
+constexpr int kMaxUpmixers = 4;            // upmixer slots
+
+// Theme presets (index stored in the project and, as "last chosen", for the whole PC user)
+enum class ThemeId : int { Cyberpunk = 0, WhiteModern = 1, CoolBeaches = 2 };
+constexpr int kNumThemes = 3;
+
 // Editor base size (everything is drawn in these coordinates and scaled).
-constexpr int kBaseWidth  = 1280;
+constexpr int kBaseWidth  = 1740;
 constexpr int kBaseHeight = 812;
 } // namespace ab

@@ -279,6 +279,13 @@ bool UpmixerHost::refreshLatency()
     return true;
 }
 
+void UpmixerHost::resetPlugin()
+{
+    const juce::ScopedLock sl (lock);
+    if (slot != nullptr && slot->instance != nullptr)
+        slot->instance->reset();
+}
+
 //==============================================================================
 juce::String UpmixerHost::getStateBase64() const
 {

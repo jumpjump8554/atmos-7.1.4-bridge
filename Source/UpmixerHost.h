@@ -42,6 +42,7 @@ public:
     juce::AudioPluginInstance* getInstance() const noexcept { return slot ? slot->instance.get() : nullptr; }
 
     bool refreshLatency(); // true if the hosted plugin's latency changed
+    void resetPlugin();    // clears the hosted plugin's internal buffers (before it becomes active again)
 
     juce::String getStateBase64() const;
     void setStateBase64 (const juce::String& base64);
