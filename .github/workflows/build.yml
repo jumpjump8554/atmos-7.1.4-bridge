@@ -1,0 +1,68 @@
+name: Build VST3
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dsp-tests:
+    name: DSP unit tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run tests
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -I Source tests/test_dsp.cpp -o test_dsp
+          ./test_dsp
+
+  windows:
+    name: VST3 (Windows x64)
+    runs-on: windows-latest
+    needs: dsp-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $src = "build/AtmosBridge_artefacts/Release/VST3/Atmos Bridge 7.1.4ch.vst3"
+          if (-not (Test-Path $src)) { Get-ChildItem -Recurse build/AtmosBridge_artefacts | Select-Object FullName; throw "VST3 bundle not found" }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -Recurse $src "dist/Atmos Bridge 7.1.4ch.vst3"
+          Copy-Item README.md dist/README.md
+          Compress-Archive -Path dist/* -DestinationPath Atmos-Bridge-7.1.4ch-VST3-win64.zip -Force
+          Get-ChildItem -Recurse dist | Select-Object FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Atmos-Bridge-7.1.4ch-VST3-win64
+          path: Atmos-Bridge-7.1.4ch-VST3-win64.zip
+
+      # Pushes to main publish/refresh the release for the version in CMakeLists.txt.
+      - name: Publish release
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VER="v$(sed -n 's/^project (AtmosBridge VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          echo "Release $VER"
+          NOTES="Windows x64 VST3 (build ${GITHUB_SHA::7}). Unzip and copy the 'Atmos Bridge 7.1.4ch.vst3' folder to C:\\Program Files\\Common Files\\VST3. See README for setup."
+          if gh release view "$VER" > /dev/null 2>&1; then
+            gh release upload "$VER" Atmos-Bridge-7.1.4ch-VST3-win64.zip --clobber
+            gh release edit "$VER" --notes "$NOTES"
+          else
+            gh release create "$VER" Atmos-Bridge-7.1.4ch-VST3-win64.zip --target "$GITHUB_SHA" \
+              --title "Atmos Bridge 7.1.4ch $VER" --notes "$NOTES"
+          fi

@@ -1,0 +1,63 @@
+#pragma once
+// Output engine: renders 12 static 7.1.4 objects through Windows' ISpatialAudioClient.
+// Windows' spatial renderer ("Dolby Atmos for home theater") encodes them (Dolby MAT over HDMI).
+// Runs its own event-driven thread (MMCSS "Pro Audio"), reconnects automatically after device changes.
+
+#include "../dsp/OutputFeeder.h"
+#include <atomic>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace ab
+{
+struct OutputDevice
+{
+    std::string id;    // endpoint ID (UTF-8)
+    std::string name;  // friendly name (UTF-8)
+    bool isDefault = false;
+};
+
+enum class EngineStatus : int
+{
+    Stopped = 0,
+    Connecting,     // trying to open the device / stream
+    Running,        // spatial stream running, spatial sound format active
+    SpatialOff,     // device found but no spatial sound format active (stream not available)
+    NoDevice,       // selected device missing
+    Error,          // other failure (see getLastError)
+    Unsupported     // not Windows
+};
+
+class SpatialEngine
+{
+public:
+    explicit SpatialEngine (OutputFeeder& feeder);
+    ~SpatialEngine();
+
+    void start();
+    void stop();
+
+    void setDeviceId (const std::string& endpointId); // "" = automatic (first device with spatial sound)
+    std::string getDeviceId() const;
+    void requestReconnect();
+
+    EngineStatus getStatus() const noexcept;
+    bool isReconnecting() const noexcept;
+    std::string getDeviceName() const;
+    std::string getLastError() const;
+    int getMaxDynamicObjects() const noexcept;
+    double getOutputRate() const noexcept;
+    int getPeriodFrames() const noexcept;
+    uint32_t getReconnectCount() const noexcept;
+    bool isMemoryLocked() const noexcept;
+
+    static std::vector<OutputDevice> listOutputDevices();
+
+    struct Impl;
+private:
+    std::unique_ptr<Impl> impl;
+};
+
+const char* toString (EngineStatus s) noexcept;
+} // namespace ab

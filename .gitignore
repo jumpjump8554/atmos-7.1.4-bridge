@@ -1,0 +1,9 @@
+build/
+build-*/
+dist/
+*.zip
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+/test_dsp
