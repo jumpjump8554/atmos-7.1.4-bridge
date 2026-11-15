@@ -53,6 +53,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AtmosBridgeProcessor::create
         ParameterID { "mode", 1 }, "Latency Mode",
         juce::StringArray { "Default", "Low latency", "Ultra low latency" }, 0));
     layout.add (std::make_unique<juce::AudioParameterBool> (ParameterID { "limiter", 2 }, "Clipping Prevention", true));
+    layout.add (std::make_unique<juce::AudioParameterBool> (ParameterID { "bypass", 3 }, "Bypass", false));
     return layout;
 }
 
@@ -74,6 +75,7 @@ AtmosBridgeProcessor::AtmosBridgeProcessor()
     }
     modeParam = apvts.getRawParameterValue ("mode");
     limiterParam = apvts.getRawParameterValue ("limiter");
+    bypassParam = apvts.getRawParameterValue ("bypass");
     for (auto& h : hosts) h = std::make_unique<UpmixerHost>();
 
     const int userTheme = readUserTheme();
@@ -224,17 +226,54 @@ void AtmosBridgeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     juce::ScopedNoDenormals noDenormals;
     const int total = buffer.getNumSamples();
     const int chunk = inWork.getNumSamples();
+    const int numIn = juce::jmin (getTotalNumInputChannels(), buffer.getNumChannels());
+
+    // BYPASS crossfade (20 ms): Atmos output fades out while the host output fades in, and back.
+    const float target = bypassParam->load (std::memory_order_relaxed) > 0.5f ? 1.0f : 0.0f;
+    const float step = (float) (1.0 / (0.020 * currentSampleRate));
+    const float mixStart = bypassMix;
 
     if (chunk > 0)
         for (int start = 0; start < total; start += chunk)
-            processChunk (buffer, start, juce::jmin (chunk, total - start));
+        {
+            const int n = juce::jmin (chunk, total - start);
+            const float m0 = bypassMix;
+            const float m1 = target > m0 ? juce::jmin (target, m0 + step * (float) n) : juce::jmax (target, m0 - step * (float) n);
+            bypassMix = m1;
+            if (m0 >= 1.0f && m1 >= 1.0f)
+                pushSilence (n);                         // fully bypassed: keep the Atmos stream fed with silence
+            else
+                processChunk (buffer, start, n, 1.0f - m0, 1.0f - m1);
+        }
 
-    // The audio leaves through Windows Spatial Audio (HDMI) only: the host gets silence,
-    // so nothing is played twice. The host output only provides the clock.
-    buffer.clear();
+    // Normally the audio leaves through Windows Spatial Audio (HDMI) only: the host gets silence,
+    // so nothing is played twice (the host output only provides the clock).
+    // BYPASS: the host input passes through unchanged.
+    for (int c = numIn; c < buffer.getNumChannels(); ++c) buffer.clear (c, 0, total);
+    if (mixStart <= 0.0f && bypassMix <= 0.0f)
+        buffer.clear();
+    else if (! (mixStart >= 1.0f && bypassMix >= 1.0f))
+        for (int c = 0; c < numIn; ++c) buffer.applyGainRamp (c, 0, total, mixStart, bypassMix);
 }
 
-void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int start, int n)
+void AtmosBridgeProcessor::pushSilence (int n)
+{
+    for (int c = 0; c < kNumChannels; ++c)
+    {
+        juce::FloatVectorOperations::clear (posPtrs[(size_t) c], n);
+        inRms[(size_t) c].store (0.0f, std::memory_order_relaxed);
+        posRms[(size_t) c].store (0.0f, std::memory_order_relaxed);
+        inMeanSq[(size_t) c] = posMeanSq[(size_t) c] = 0.0f;
+    }
+    limGainDb.store (0.0f, std::memory_order_relaxed);
+    if (ownsOutput.load (std::memory_order_acquire) && ! isNonRealtime())
+    {
+        shared->feeder.setMode ((int) getMode());
+        shared->feeder.producerPush (posPtrs.data(), n);
+    }
+}
+
+void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int start, int n, float atmosGain0, float atmosGain1)
 {
     const int numIn = juce::jmin (getTotalNumInputChannels(), buffer.getNumChannels());
     const double sr = currentSampleRate;
@@ -353,6 +392,17 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
         limGainDb.store (0.0f, std::memory_order_relaxed);
     }
     limiterWasOn = limOn;
+
+    // BYPASS crossfade on the Atmos side
+    if (atmosGain0 < 1.0f || atmosGain1 < 1.0f)
+    {
+        const float d = (atmosGain1 - atmosGain0) / (float) n;
+        for (int p = 0; p < kNumChannels; ++p)
+        {
+            float* x = posPtrs[(size_t) p];
+            for (int k = 0; k < n; ++k) x[k] *= atmosGain0 + d * (float) k;
+        }
+    }
 
     // 6) Meters (~80 ms RMS)
     const float a = (float) std::exp (-(double) n / (0.08 * sr));
@@ -527,6 +577,12 @@ void AtmosBridgeProcessor::setLimiterOn (bool on)
 {
     setParam ("limiter", on ? 1.0f : 0.0f);
     logLine (std::string ("Clipping prevention ") + (on ? "on" : "off"));
+}
+
+void AtmosBridgeProcessor::setBypassed (bool shouldBypass)
+{
+    setParam ("bypass", shouldBypass ? 1.0f : 0.0f);
+    logLine (std::string ("Atmos Bridge ") + (shouldBypass ? "BYPASS on" : "BYPASS off"));
 }
 
 void AtmosBridgeProcessor::setTheme (ThemeId t)

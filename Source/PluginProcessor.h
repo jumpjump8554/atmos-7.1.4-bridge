@@ -95,6 +95,13 @@ public:
     float getUiScale() const noexcept { return uiScale; }
     void setUiScale (float s);
 
+    // BYPASS of the whole plugin: the host input goes straight back to the host output (unchanged),
+    // the Atmos output plays silence (the stream stays open, so switching back is instant).
+    // Also the VST3 bypass parameter, so the host's own bypass button does the same. 20 ms crossfade.
+    bool isBypassed() const noexcept { return bypassParam->load() > 0.5f; }
+    void setBypassed (bool shouldBypass);
+    juce::AudioProcessorParameter* getBypassParameter() const override { return apvts.getParameter ("bypass"); }
+
     // Clipping prevention (-1.0 dBFS, 12 channels linked, zero latency)
     bool isLimiterOn() const noexcept { return limiterParam->load() > 0.5f; }
     void setLimiterOn (bool on);
@@ -143,7 +150,8 @@ private:
     void updateChannelTable();
     void writeExtrasToState();
     void readExtrasFromState();
-    void processChunk (juce::AudioBuffer<float>& buffer, int start, int num);
+    void processChunk (juce::AudioBuffer<float>& buffer, int start, int num, float atmosGain0, float atmosGain1);
+    void pushSilence (int num);
     void setParam (const juce::String& id, float plainValue);
 
     using Map = std::array<int, ab::kNumChannels>;
@@ -166,6 +174,8 @@ private:
     std::array<std::atomic<float>*, ab::kNumChannels> muteParams {};
     std::atomic<float>* modeParam = nullptr;
     std::atomic<float>* limiterParam = nullptr;
+    std::atomic<float>* bypassParam = nullptr;
+    float bypassMix = 0.0f;   // audio thread: 0 = Atmos Bridge active, 1 = bypassed
 
     std::array<std::atomic<int>, ab::kNumChannels> outMap;
     std::array<std::atomic<int>, ab::kMaxInputs> hostToJuce;   // host channel index -> JUCE buffer index

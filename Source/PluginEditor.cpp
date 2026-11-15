@@ -339,7 +339,7 @@ const juce::Rectangle<float> kModeGroup  { 1482.0f, 32.0f, 218.0f, 36.0f };
 const juce::Rectangle<float> kDropouts   { 1366.0f, 744.0f, 84.0f, 36.0f };
 
 // MapPanel rows
-constexpr int kRowY0 = 114, kRowH = 35;
+constexpr int kRowY0 = 124, kRowH = 34;
 } // namespace
 
 //==============================================================================
@@ -643,6 +643,7 @@ public:
     RoomView (AtmosBridgeProcessor& p, const UiCtx& c) : proc (p), ctx (c), staticPart (c)
     {
         addAndMakeVisible (staticPart);
+        setComponentID ("room");
         setTooltip (tr ("스피커를 클릭하면 해당 위치로 핑크 노이즈(-20 dBFS)가 나갑니다. 다시 클릭하면 멈춥니다."));
     }
 
@@ -698,20 +699,64 @@ public:
         for (int p = 0; p < kNumChannels; ++p)
             drawSpeaker (g, t, p, level[(size_t) p], clipHold[(size_t) p] > 0, p == posNoise,
                          numbers[p].isEmpty() ? tr ("\xe2\x80\x93") : numbers[p]);
+
+        if (proc.isBypassed())
+        {
+            // Veil + label: the Atmos output is paused, the original goes to the host output.
+            g.setColour ((t.dark ? juce::Colours::black : juce::Colours::white).withAlpha (t.dark ? 0.45f : 0.55f));
+            g.fillAll();
+            const auto tag = kBypassTag;
+            g.setColour (tagHover ? (t.dark ? t.bypBorder.brighter (0.25f) : t.bypBorder.darker (0.12f)) : t.bypBorder);
+            g.fillRoundedRectangle (tag, 10.0f);
+            const auto fg = t.dark ? C (0xff1a1600) : t.titleA;
+            drawTextPath (g, "BYPASS", uiFont (22.0f, true), tag.withHeight (36.0f).translated (0, 4), juce::Justification::centred, fg);
+            g.setColour (fg);
+            g.setFont (uiFont (13.5f));
+            g.drawText (tr ("Atmos 출력 정지 \xc2\xb7 원본은 호스트 출력으로"), tag.withTrimmedTop (34.0f).toNearestInt(), juce::Justification::centred);
+        }
     }
 
     void mouseMove (const juce::MouseEvent& e) override
     {
+        if (proc.isBypassed())
+        {
+            // While bypassed only the BYPASS label reacts: clicking it turns BYPASS off.
+            const bool over = kBypassTag.contains (e.position);
+            if (over != tagHover) { tagHover = over; repaint(); }
+            setMouseCursor (over ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+            setTooltip (over ? tr ("클릭하면 BYPASS 해제") : juce::String());
+            return;
+        }
+        setTooltip (tr ("스피커를 클릭하면 해당 위치로 핑크 노이즈(-20 dBFS)가 나갑니다. 다시 클릭하면 멈춥니다."));
         setMouseCursor (hitSpeaker (e.position) >= 0 ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+    }
+
+    void mouseExit (const juce::MouseEvent&) override
+    {
+        if (tagHover) { tagHover = false; repaint(); }
     }
 
     void mouseDown (const juce::MouseEvent& e) override
     {
+        if (proc.isBypassed())
+        {
+            if (kBypassTag.contains (e.position))
+            {
+                proc.setBypassed (false);
+                tagHover = false;
+                setMouseCursor (juce::MouseCursor::NormalCursor);
+                repaint();
+            }
+            return; // speaker test tones are silent while bypassed, so speaker clicks do nothing
+        }
         const int p = hitSpeaker (e.position);
         if (p >= 0) proc.togglePositionNoise (p);
     }
 
 private:
+    inline static const juce::Rectangle<float> kBypassTag { 250.0f, 206.0f, 280.0f, 66.0f }; // over the screen
+    bool tagHover = false;
+
     int hitSpeaker (juce::Point<float> pt) const
     {
         for (int p = 0; p < kNumChannels; ++p)
@@ -857,9 +902,9 @@ public:
         for (int i = 0; i < kNumChannels; ++i)
         {
             const int y = kRowY0 + i * kRowH;
-            numBox[(size_t) i].setBounds (76, y + 4, 52, 28);
-            noiseBtn[(size_t) i]->setBounds (230, y + 4, 30, 28);
-            muteBtn[(size_t) i].setBounds (272, y + 4, 30, 28);
+            numBox[(size_t) i].setBounds (76, y + 3, 52, 28);
+            noiseBtn[(size_t) i]->setBounds (230, y + 3, 30, 28);
+            muteBtn[(size_t) i].setBounds (272, y + 3, 30, 28);
         }
     }
 
@@ -921,7 +966,7 @@ public:
         for (int i = 0; i < kNumChannels; ++i) anyDup = anyDup || proc.isDuplicatePosition (proc.getPosition (i));
         if (anyDup)
         {
-            juce::Rectangle<float> banner (18, 64, 404, 26);
+            juce::Rectangle<float> banner (18, 78, 404, 24);
             g.setColour (t.warnBg); g.fillRoundedRectangle (banner, 6);
             g.setColour (t.warnBorder); g.drawRoundedRectangle (banner, 6, 1);
             g.setColour (t.clip); g.setFont (uiFont (14.5f));
@@ -948,7 +993,7 @@ public:
             g.drawText (target, 140, y, 44, kRowH, juce::Justification::centredLeft);
             if (dup)
             {
-                juce::Rectangle<float> tag (184, (float) y + 11, 34, 15);
+                juce::Rectangle<float> tag (184, (float) y + 10, 34, 15);
                 g.setColour (t.warnBorder); g.drawRoundedRectangle (tag, 4, 1);
                 g.setColour (t.clip); g.setFont (uiFont (12.0f));
                 g.drawText (tr ("중복"), tag.toNearestInt(), juce::Justification::centred);
@@ -956,7 +1001,7 @@ public:
 
             // Meter
             const float l = displayLevel (rms[(size_t) i]);
-            juce::Rectangle<float> bar (312, (float) y + 14, 60, 8);
+            juce::Rectangle<float> bar (312, (float) y + 13, 60, 8);
             g.setColour (t.field); g.fillRoundedRectangle (bar, 4);
             if (l > 0.0f)
             {
@@ -974,15 +1019,17 @@ public:
         g.setColour (t.rowLine);
         g.drawHorizontalLine (ry, 18.0f, 422.0f);
 
-        // Whose number table is shown (each upmixer slot keeps its own)
+        // Which upmixer is applied (the number table shown belongs to it: each slot keeps its own)
         const int a = proc.getActiveSlot();
         const juce::String owner = a >= 0 ? proc.getSlot (a).name : tr ("업믹서 없음 (호스트 채널 1~12)");
         g.setFont (uiFont (14.0f));
         g.setColour (t.sub);
-        g.drawText (tr ("번호표: "), 18, ry + 8, 56, 22, juce::Justification::centredLeft);
+        const juce::String label = tr ("적용된 업믹서:");
+        const int labelW = juce::roundToInt (juce::GlyphArrangement::getStringWidth (uiFont (14.0f), label));
+        g.drawText (label, 18, ry + 6, labelW + 2, 22, juce::Justification::centredLeft);
         g.setColour (t.text);
         g.setFont (uiFont (14.0f, true));
-        g.drawText (owner, 74, ry + 8, 348, 22, juce::Justification::centredLeft, true);
+        g.drawText (owner, 18 + labelW + 8, ry + 6, 404 - labelW - 8, 22, juce::Justification::centredLeft, true);
     }
 
 private:
@@ -1135,7 +1182,7 @@ private:
 class RightPanel final : public juce::Component
 {
 public:
-    static constexpr int kSlotY0 = 126, kSlotH = 56, kSlotStep = 66;
+    static constexpr int kSlotY0 = 166, kSlotH = 56, kSlotStep = 66;
 
     RightPanel (AtmosBridgeProcessor& p, const UiCtx& c) : proc (p), ctx (c), addBtn (c)
     {
@@ -1144,6 +1191,14 @@ public:
         limBtn.setTooltip (tr ("-1.0 dBFS를 넘지 않게 12채널을 같은 비율로 줄입니다 (지연 0 ms)"));
         limBtn.onClick = [this] { proc.setLimiterOn (! proc.isLimiterOn()); };
         addAndMakeVisible (limBtn);
+
+        bypassBtn.getProperties().set ("radius", 16.0);
+        bypassBtn.getProperties().set ("bold", true);
+        bypassBtn.setButtonText ("BYPASS");
+        bypassBtn.setTooltip (tr ("Atmos Bridge 전체 바이패스: 원본 신호를 호스트 출력으로 그대로 보내고 Atmos 출력은 멈춥니다 "
+                                  "(호스트의 바이패스 버튼과 같은 기능)"));
+        bypassBtn.onClick = [this] { proc.setBypassed (! proc.isBypassed()); };
+        addAndMakeVisible (bypassBtn);
 
         for (int i = 0; i < kMaxUpmixers; ++i)
         {
@@ -1165,7 +1220,8 @@ public:
 
     void resized() override
     {
-        limBtn.setBounds (340, 22, 82, 32);
+        limBtn.setBounds (18, 72, 82, 32);
+        bypassBtn.setBounds (234, 72, 108, 32);
         layoutSlots();
     }
 
@@ -1179,6 +1235,17 @@ public:
             limBtn.setButtonText (lim ? tr ("켜짐") : tr ("꺼짐"));
             styleToggle (limBtn, t, lim);
             limBtn.repaint();
+        }
+
+        const bool byp = proc.isBypassed();
+        if (byp != shownBypass || themeDirty)
+        {
+            shownBypass = byp;
+            bypassBtn.setColour (juce::TextButton::buttonColourId, byp ? t.bypBorder : t.btn);
+            bypassBtn.setColour (juce::TextButton::textColourOffId, byp ? (t.dark ? C (0xff1a1600) : t.titleA) : t.dim);
+            setBorder (bypassBtn, byp ? t.bypBorder : t.btnBorder);
+            bypassBtn.repaint();
+            repaint();
         }
 
         const int version = proc.getSlotsVersion();
@@ -1206,6 +1273,10 @@ public:
     void paint (juce::Graphics& g) override
     {
         const auto& t = ctx.th();
+        g.setFont (uiFont (13.5f));
+        g.setColour (shownBypass ? t.bypFg : t.sub);
+        g.drawText (shownBypass ? tr ("바이패스 중") : tr ("꺼짐"), 350, 72, 72, 32, juce::Justification::centredLeft);
+
         const int n = proc.getNumSlots();
         int y = kSlotY0 + n * kSlotStep + 46;
         if (n == 0)
@@ -1282,13 +1353,13 @@ private:
 
     AtmosBridgeProcessor& proc;
     const UiCtx& ctx;
-    juce::TextButton limBtn;
+    juce::TextButton limBtn, bypassBtn;
     std::array<std::unique_ptr<SlotRow>, kMaxUpmixers> rows;
     AddButton addBtn;
     juce::Array<juce::File> installed;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::String lastError;
-    bool shownLimiter = false, themeDirty = true;
+    bool shownLimiter = false, shownBypass = false, themeDirty = true;
     int shownVersion = -1, shownCount = -1, slowTick = 0;
 };
 
@@ -1346,14 +1417,15 @@ public:
         drawHeading (g, t, tr ("채널 매핑"), { 18, 14, 200, 26 });
         g.setColour (t.sub);
         g.setFont (uiFont (14.5f));
-        g.drawText (tr ("입력 채널마다 출력 위치 번호를 지정합니다. 0 = 끄기"), 18, 40, 300, 18, juce::Justification::centredLeft, true);
+        g.drawText (tr ("입력 채널마다 출력 위치 번호를 지정합니다."), 18, 40, 230, 18, juce::Justification::centredLeft, true);
+        g.drawText (tr ("0=끄기"), 18, 58, 230, 18, juce::Justification::centredLeft, true);
         g.setFont (uiFont (14.0f));
-        g.drawText (tr ("입력"), 18, 94, 50, 16, juce::Justification::centredLeft);
-        g.drawText (tr ("번호"), 76, 94, 56, 16, juce::Justification::centredLeft);
-        g.drawText (tr ("출력 위치"), 140, 94, 80, 16, juce::Justification::centredLeft);
-        g.drawText (tr ("노이즈"), 226, 94, 38, 16, juce::Justification::centred);
-        g.drawText (tr ("뮤트"), 268, 94, 38, 16, juce::Justification::centred);
-        g.drawText (tr ("레벨"), 312, 94, 60, 16, juce::Justification::centredLeft);
+        g.drawText (tr ("입력"), 18, 106, 50, 16, juce::Justification::centredLeft);
+        g.drawText (tr ("번호"), 76, 106, 56, 16, juce::Justification::centredLeft);
+        g.drawText (tr ("출력 위치"), 140, 106, 80, 16, juce::Justification::centredLeft);
+        g.drawText (tr ("노이즈"), 226, 106, 38, 16, juce::Justification::centred);
+        g.drawText (tr ("뮤트"), 268, 106, 38, 16, juce::Justification::centred);
+        g.drawText (tr ("레벨"), 312, 106, 60, 16, juce::Justification::centredLeft);
         drawWrapped (g, tr ("핑크 노이즈 -20 dBFS RMS (LFE는 120 Hz 이하) \xc2\xb7 테스트 중에는 음악이 잠시 멈춥니다"),
                      uiFont (14.0f), t.sub, { 18, 570, 404, 44 });
         g.restoreState();
@@ -1361,16 +1433,22 @@ public:
         // Right panel static texts
         g.saveState();
         g.setOrigin (kRight.getPosition());
-        drawHeading (g, t, tr ("클리핑 방지"), { 18, 14, 200, 26 });
+        drawHeading (g, t, tr ("클리핑 방지"), { 18, 14, 190, 26 });
         g.setColour (t.sub);
-        g.setFont (uiFont (15.0f));
-        g.drawText (tr ("-1.0 dBFS \xc2\xb7 12채널 연동"), 18, 42, 300, 20, juce::Justification::centredLeft);
+        g.setFont (uiFont (14.5f));
+        g.drawText (tr ("-1.0 dBFS \xc2\xb7 12채널 연동"), 18, 42, 196, 20, juce::Justification::centredLeft);
         g.setColour (t.divider);
-        g.fillRect (18.0f, 76.0f, 404.0f, 1.0f);
-        drawHeading (g, t, tr ("업믹서"), { 18, 90, 100, 26 });
+        g.fillRect (220.0f, 18.0f, 1.0f, 86.0f);
+        drawHeading (g, t, "BYPASS", { 234, 14, 188, 26 });
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.5f));
+        g.drawText (tr ("Atmos Bridge 7.1.4ch 전체"), 234, 42, 188, 20, juce::Justification::centredLeft);
+        g.setColour (t.divider);
+        g.fillRect (18.0f, 118.0f, 404.0f, 1.0f);
+        drawHeading (g, t, tr ("업믹서"), { 18, 130, 100, 26 });
         g.setColour (t.sub);
         g.setFont (uiFont (14.0f));
-        g.drawText (tr ("O/X 켜기\xc2\xb7끄기 (하나만 켜짐) \xc2\xb7 B 바이패스 \xc2\xb7 D 삭제"), 104, 90, 318, 26,
+        g.drawText (tr ("O/X 켜기\xc2\xb7끄기 (하나만 켜짐) \xc2\xb7 B 바이패스 \xc2\xb7 D 삭제"), 104, 130, 318, 26,
                     juce::Justification::centredRight, true);
         drawWrapped (g, tr ("이름을 누르면 설정 창 \xc2\xb7 업믹서 입력: 호스트 채널 1~2 \xc2\xb7 "
                             "슬롯마다 채널 번호표를 따로 기억 \xc2\xb7 설정은 프로젝트와 함께 저장"),
@@ -1793,6 +1871,12 @@ private:
             else if (s->feeder.isProducerBursty())  { clockColour = t.amber; clockText = tr ("호스트 처리 불규칙"); }
             else if (drift > 300.0f)                { clockColour = t.amber; clockText = tr ("클럭 차이 큼: 호스트 출력=AVR 권장"); }
             else                                    { clockColour = t.ok;    clockText = tr ("클럭: 호스트와 동기 정상"); }
+        }
+
+        if (proc.isBypassed())
+        {
+            statusColour = t.bypBorder;
+            statusText = tr ("BYPASS \xc2\xb7 원본 신호가 호스트 출력으로 그대로 나갑니다");
         }
 
         const int iNoise = proc.getInputNoise();
