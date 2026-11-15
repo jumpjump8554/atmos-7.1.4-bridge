@@ -337,6 +337,7 @@ const juce::Rectangle<float> kStatusPill { 988.0f, 34.0f, 346.0f, 32.0f };
 const juce::Rectangle<float> kRatePill   { 1346.0f, 34.0f, 124.0f, 32.0f };
 const juce::Rectangle<float> kModeGroup  { 1482.0f, 32.0f, 218.0f, 36.0f };
 const juce::Rectangle<float> kDropouts   { 1366.0f, 744.0f, 84.0f, 36.0f };
+const juce::Rectangle<float> kDirectPill { 846.0f, 748.0f, 200.0f, 28.0f };
 
 // MapPanel rows
 constexpr int kRowY0 = 124, kRowH = 34;
@@ -1574,7 +1575,7 @@ public:
         static const char* modeTips[kNumModes] = {
             "기본 모드: 여유 버퍼 100 ms (가장 안정적)",
             "저지연 모드: 여유 버퍼 8 ms, 끊기면 10 ms씩 자동으로 늘림 (최대 +60 ms)",
-            "초저지연 모드: 여유 버퍼 4.5 ms (최소), 자동 보정 없음 \xc2\xb7 끊김은 횟수로만 표시"
+            "초저지연 모드: 직접 루프백(호스트 구간 생략) + 여유 버퍼 자동 보정(끊김 0 우선)"
         };
         for (int m = 0; m < kNumModes; ++m)
         {
@@ -1606,6 +1607,19 @@ public:
         };
         fillDevices();
         addAndMakeVisible (device);
+
+        directBox.setTooltip (tr ("초저지연 입력: 플레이어가 소리를 내보내는 장치(CABLE In 16ch)를 Atmos Bridge가 직접 받아(루프백) "
+                                  "호스트 구간의 지연을 없앱니다. 문제가 생기면 호스트 입력으로 자동 전환합니다."));
+        directBox.beforePopup = [this] { fillDirectSources(); };
+        directBox.onChange = [this]
+        {
+            const int idx = directBox.getSelectedItemIndex();
+            if (idx >= 0 && idx < directIds.size()) proc.setDirectSourceId (directIds[idx]);
+        };
+        fillDirectSources();
+        addAndMakeVisible (directBox);
+        directTip.setInterceptsMouseClicks (true, false);
+        addAndMakeVisible (directTip);
 
         seqBtn.onClick = [this] { proc.toggleSequence(); };
         seqBtn.setTooltip (tr ("12개 위치에 차례로 핑크 노이즈를 2초씩 내보냅니다"));
@@ -1656,6 +1670,13 @@ public:
         device.setColour (juce::ComboBox::textColourId, t.text);
         device.setColour (juce::ComboBox::outlineColourId, t.btnBorder);
         device.setColour (juce::ComboBox::arrowColourId, t.sub);
+        for (auto* cb : { (juce::ComboBox*) &directBox })
+        {
+            cb->setColour (juce::ComboBox::backgroundColourId, t.field);
+            cb->setColour (juce::ComboBox::textColourId, t.text);
+            cb->setColour (juce::ComboBox::outlineColourId, t.btnBorder);
+            cb->setColour (juce::ComboBox::arrowColourId, t.sub);
+        }
         stylePlain (stopBtn, t);
 
         background.repaint();
@@ -1680,6 +1701,8 @@ public:
         right.setBounds (kRight);
         seqBtn.setBounds (40, 744, 136, 36);
         stopBtn.setBounds (184, 744, 104, 36);
+        directBox.setBounds (548, 746, 288, 32);
+        directTip.setBounds (kDirectPill.toNearestInt());
         statusTip.setBounds (kStatusPill.toNearestInt());
     }
 
@@ -1712,6 +1735,13 @@ public:
         seqBtn.setColour (juce::TextButton::textColourOffId, t.text);
         setBorder (seqBtn, seq ? t.neon : t.btnBorder);
         seqBtn.repaint();
+
+        if (! directBox.isPopupActive())
+        {
+            const int idx = directIds.indexOf (proc.getDirectSourceId());
+            if (idx >= 0 && directBox.getSelectedItemIndex() != idx)
+                directBox.setSelectedItemIndex (idx, juce::dontSendNotification);
+        }
 
         if (! device.isPopupActive())
         {
@@ -1749,10 +1779,18 @@ public:
 
         // Footer
         g.setColour (t.sub); g.setFont (uiFont (15.0f));
-        g.drawText (testText, 298, 744, 440, 36, juce::Justification::centredLeft, true);
+        g.drawText (testText, 298, 744, 242, 36, juce::Justification::centredLeft, true);
 
+        // Ultra low latency input state
+        g.setColour (directColour.withAlpha (t.dark ? 0.10f : 0.12f)); g.fillRoundedRectangle (kDirectPill, 14);
+        g.setColour (directColour.withAlpha (0.45f)); g.drawRoundedRectangle (kDirectPill.reduced (0.5f), 14, 1);
+        g.setColour (directColour); g.fillEllipse (kDirectPill.getX() + 12, kDirectPill.getCentreY() - 4, 8, 8);
+        g.setColour (t.text); g.setFont (uiFont (14.5f));
+        g.drawText (directText, kDirectPill.withTrimmedLeft (26).withTrimmedRight (8).toNearestInt(), juce::Justification::centredLeft, true);
+
+        g.setColour (t.sub);
         g.setFont (uiFont (15.5f));
-        g.drawText (modeText, 700, 744, 656, 36, juce::Justification::centredRight, true);
+        g.drawText (modeText, 1056, 744, 300, 36, juce::Justification::centredRight, true);
 
         g.setColour (dropouts > 0 ? t.amber : t.sub);
         g.drawText (tr ("끊김 ") + juce::String (dropouts), kDropouts.toNearestInt(), juce::Justification::centred);
@@ -1791,6 +1829,32 @@ private:
             device.addItem (tr ("저장된 장치 (연결 안 됨)"), id++);
         }
         device.setSelectedItemIndex (juce::jmax (0, deviceIds.indexOf (want)), juce::dontSendNotification);
+    }
+
+    void fillDirectSources()
+    {
+        directIds.clear();
+        directBox.clear (juce::dontSendNotification);
+        directIds.add ({});
+        directBox.addItem (tr ("입력: 자동 (CABLE In 16ch 직접 루프백)"), 1);
+        int id = 2;
+        const auto atmosOut = proc.getOutputDeviceId();
+        for (const auto& d : SpatialEngine::listOutputDevices())
+        {
+            const auto devId = juce::String::fromUTF8 (d.id.c_str());
+            if (devId == atmosOut) continue;                     // never loop back the Atmos output itself
+            directIds.add (devId);
+            directBox.addItem (tr ("입력: ") + juce::String::fromUTF8 (d.name.c_str()) + tr (" (직접 루프백)"), id++);
+        }
+        const auto want = proc.getDirectSourceId();
+        if (want.isNotEmpty() && want != "host" && ! directIds.contains (want))
+        {
+            directIds.add (want);
+            directBox.addItem (tr ("입력: 저장된 장치 (연결 안 됨)"), id++);
+        }
+        directIds.add ("host");
+        directBox.addItem (tr ("입력: 호스트 (직접 루프백 끄기)"), id++);
+        directBox.setSelectedItemIndex (juce::jmax (0, directIds.indexOf (want)), juce::dontSendNotification);
     }
 
     void updateStatus()
@@ -1857,12 +1921,20 @@ private:
             const int mode = (int) proc.getMode();
             const double margin = s->feeder.getMarginMs();
             const double upLat = proc.getUpmixerLatencyMs();
-            modeText = tr (modeNames[mode]) + tr (" \xc2\xb7 여유 버퍼 ")
-                     + juce::String (margin, margin == std::floor (margin) ? 0 : 1)
-                     + tr (" ms \xc2\xb7 플러그인 지연 ")
-                     + (running && s->feeder.getState() == OutputFeeder::State::Running
-                            ? juce::String (s->feeder.getLatencyMs() + upLat, 1) + " ms" : juce::String ("-- ms"))
-                     + (upLat > 0.0 ? tr (" (업믹서 포함)") : juce::String());
+            juce::ignoreUnused (modeNames);
+            const auto ds = proc.getDirectStatus();
+            const bool direct = mode == (int) LatencyMode::Ultra
+                                && (ds.state == AtmosBridgeProcessor::DirectStatus::Settling || ds.state == AtmosBridgeProcessor::DirectStatus::Running);
+            if (direct)
+                modeText = tr ("여유 ") + juce::String (ds.marginMs, 1) + tr (" ms (자동) \xc2\xb7 지연 ")
+                         + (ds.latencyMs > 0.0 ? juce::String (ds.latencyMs + upLat, 1) + " ms" : juce::String ("-- ms"))
+                         + (upLat > 0.0 ? tr (" (업믹서 포함)") : juce::String());
+            else
+                modeText = tr ("여유 ") + juce::String (margin, margin == std::floor (margin) ? 0 : 1)
+                         + tr (" ms \xc2\xb7 지연 ")
+                         + (running && s->feeder.getState() == OutputFeeder::State::Running
+                                ? juce::String (s->feeder.getLatencyMs() + upLat, 1) + " ms" : juce::String ("-- ms"))
+                         + (upLat > 0.0 ? tr (" (업믹서 포함)") : juce::String());
             dropouts = (int) s->feeder.getDropouts();
 
             const float drift = std::abs (s->feeder.getDriftPpm());
@@ -1871,6 +1943,24 @@ private:
             else if (s->feeder.isProducerBursty())  { clockColour = t.amber; clockText = tr ("호스트 처리 불규칙"); }
             else if (drift > 300.0f)                { clockColour = t.amber; clockText = tr ("클럭 차이 큼: 호스트 출력=AVR 권장"); }
             else                                    { clockColour = t.ok;    clockText = tr ("클럭: 호스트와 동기 정상"); }
+        }
+
+        // Ultra low latency input pill
+        {
+            const auto ds = proc.getDirectStatus();
+            const bool ultra = proc.getMode() == LatencyMode::Ultra;
+            using DS = AtmosBridgeProcessor::DirectStatus;
+            if (! ultra)                                    { directColour = t.sub;   directText = tr ("호스트 입력 (기본/저지연)"); }
+            else if (proc.getDirectSourceId() == "host")    { directColour = t.sub;   directText = tr ("호스트 입력 (직접 끔)"); }
+            else if (ds.state == DS::Settling)
+            {
+                const int sec = juce::jmax (0, (int) std::ceil (ds.settleSec));
+                directColour = t.amber;
+                directText = tr ("안정화 중 ") + juce::String (sec / 60) + ":" + juce::String (sec % 60).paddedLeft ('0', 2);
+            }
+            else if (ds.state == DS::Running)               { directColour = t.ok;    directText = tr ("직접 루프백 동작 중"); }
+            else if (ds.state == DS::Fallback)              { directColour = t.amber; directText = tr ("호스트 입력으로 대체 중"); }
+            else                                            { directColour = t.sub;   directText = tr ("직접 루프백 대기"); }
         }
 
         if (proc.isBypassed())
@@ -1895,6 +1985,15 @@ private:
             testText = {};
 
         if (tip != lastTip) { lastTip = tip; statusTip.setTooltip (tip); }
+        {
+            const auto ds = proc.getDirectStatus();
+            juce::String tipText = tr ("초저지연에서는 플레이어 소리를 Atmos Bridge가 직접 받아 호스트 구간의 지연을 없앱니다.\n"
+                                       "처음 2분은 넉넉한 여유로 이 PC의 흔들림을 재고, 끊기지 않는 만큼으로 줄입니다.\n"
+                                       "문제가 생기면 호스트 입력으로 자동 전환합니다.");
+            if (ds.source.isNotEmpty()) tipText << tr ("\n입력 장치: ") << ds.source;
+            if (ds.state == AtmosBridgeProcessor::DirectStatus::Fallback && ds.reason.isNotEmpty()) tipText << tr ("\n지금 호스트 입력을 쓰는 이유: ") << ds.reason;
+            if (tipText != lastDirectTip) { lastDirectTip = tipText; directTip.setTooltip (tipText); }
+        }
     }
 
     // Invisible component over the status pill: carries its tooltip and draws the live header/footer texts.
@@ -1932,8 +2031,11 @@ private:
     ScanlineOverlay scanlines;
     std::unique_ptr<LivePainter> livePainter;
     juce::ComboBox themeBox;
-    DeviceBox device;
-    juce::StringArray deviceIds;
+    DeviceBox device, directBox;
+    juce::StringArray deviceIds, directIds;
+    LiveLayer directTip;
+    juce::Colour directColour { juce::Colours::grey };
+    juce::String directText, lastDirectTip;
     std::array<juce::TextButton, kNumModes> modeBtn;
     juce::TextButton seqBtn, stopBtn;
     LiveLayer statusTip;

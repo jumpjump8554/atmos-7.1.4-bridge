@@ -86,13 +86,15 @@ AtmosBridgeProcessor::AtmosBridgeProcessor()
     writeExtrasToState();
     logLine ("Plugin instance created (" JucePlugin_Name " " JucePlugin_VersionString ")");
     tryClaimOutput();
-    startTimer (500);
+    startTimer (100);
 }
 
 AtmosBridgeProcessor::~AtmosBridgeProcessor()
 {
     stopTimer();
     cancelPendingUpdate();
+    directActive.store (false);
+    if (loopback) loopback->stop();
     activeHost.store (-1);
     for (auto& h : hosts) { h->beforeUnload = nullptr; h->unload(); }
     releaseOutput();
@@ -133,25 +135,34 @@ void AtmosBridgeProcessor::timerCallback()
     if (owner.load() == nullptr)
         tryClaimOutput();
 
-    bool latencyChanged = false;
-    for (auto& h : hosts) latencyChanged = h->refreshLatency() || latencyChanged;
-    if (latencyChanged) updateLatency();
+    if (++latencyTick % 5 == 0)
+    {
+        bool latencyChanged = false;
+        for (auto& h : hosts) latencyChanged = h->refreshLatency() || latencyChanged;
+        if (latencyChanged) updateLatency();
+    }
+
+   #if AB_TEST_HOOKS
+    if (! testNoAutoDirect)
+   #endif
+        updateDirect();
 
     // Every 5 s while audio is flowing: one diagnostics line in the log.
     if (auto* s = getSharedOutput())
     {
-        if (++statTick % 10 != 0) return;
+        if (++statTick % 50 != 0) return;
         const auto pushes = s->feeder.takePushCount();
         if (pushes == 0 && ! s->feeder.isProducerAlive()) return;
         char line[400];
         std::snprintf (line, sizeof (line),
                        "stats/5s: blocks=%u host=%.0f Hz/%d mode=%d margin=%.0f ms fill=%.1f ms lat=%.1f ms drift=%+.0f ppm "
-                       "drop=%u resync=%u ovf=%u dup=%u bursty=%d engine=%s period=%d memlock=%d",
+                       "drop=%u resync=%u ovf=%u dup=%u bursty=%d engine=%s period=%d memlock=%d direct=%d jit=%.1f ms conceal=%u",
                        pushes, s->feeder.getHostRate(), s->feeder.getHostBlock(), s->feeder.getMode(),
                        s->feeder.getMarginMs(), s->feeder.getFillMs(), (double) s->feeder.getLatencyMs(),
                        (double) s->feeder.getDriftPpm(), s->feeder.getDropouts(), s->feeder.getResyncs(),
                        s->feeder.getOverflows(), s->feeder.getDuplicates(), s->feeder.isProducerBursty() ? 1 : 0,
-                       toString (s->engine.getStatus()), s->engine.getPeriodFrames(), s->engine.isMemoryLocked() ? 1 : 0);
+                       toString (s->engine.getStatus()), s->engine.getPeriodFrames(), s->engine.isMemoryLocked() ? 1 : 0,
+                       directActive.load() ? 1 : 0, s->feeder.getMaxJitterMs(), s->feeder.getConcealed());
         logLine (line);
     }
 }
@@ -159,6 +170,7 @@ void AtmosBridgeProcessor::timerCallback()
 //==============================================================================
 void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
+    const juce::SpinLock::ScopedLockType sl (procLock); // the loopback thread may be processing
     currentSampleRate = sampleRate > 0 ? sampleRate : 48000.0;
     currentBlockSize = juce::jmax (1, samplesPerBlock);
 
@@ -166,6 +178,7 @@ void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     const int chunk = juce::jmax (512, currentBlockSize);
     inWork.setSize (kNumChannels, chunk, false, true, true);
     posWork.setSize (kNumChannels, chunk, false, true, true);
+    directIn.setSize (kMaxInputs, chunk, false, true, true);
     for (int c = 0; c < kNumChannels; ++c)
     {
         inPtrs[(size_t) c] = inWork.getWritePointer (c);
@@ -184,7 +197,9 @@ void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     seqSamples = 0.0;
 
     if (auto* s = getSharedOutput())
-        s->feeder.producerPrepare (currentSampleRate, currentBlockSize);
+        s->feeder.producerPrepare (currentSampleRate, directActive.load() ? juce::roundToInt (currentSampleRate / 100.0)
+                                                                          : currentBlockSize);
+    prepared = true;
 
     logLine ("prepareToPlay: " + std::to_string (currentSampleRate) + " Hz, block " + std::to_string (currentBlockSize));
 }
@@ -228,32 +243,211 @@ void AtmosBridgeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     const int chunk = inWork.getNumSamples();
     const int numIn = juce::jmin (getTotalNumInputChannels(), buffer.getNumChannels());
 
-    // BYPASS crossfade (20 ms): Atmos output fades out while the host output fades in, and back.
+    // BYPASS crossfade on the host side (20 ms): the original fades in here while the Atmos side fades out.
     const float target = bypassParam->load (std::memory_order_relaxed) > 0.5f ? 1.0f : 0.0f;
     const float step = (float) (1.0 / (0.020 * currentSampleRate));
-    const float mixStart = bypassMix;
+    const float hostStart = hostMix;
+    hostMix = target > hostMix ? juce::jmin (target, hostMix + step * (float) total)
+                               : juce::jmax (target, hostMix - step * (float) total);
 
-    if (chunk > 0)
-        for (int start = 0; start < total; start += chunk)
+    if (directActive.load (std::memory_order_acquire))
+    {
+        // Ultra low latency: the Atmos side runs on the loopback thread. Here only the host input level
+        // is taken (to notice a loopback that stays silent while the host hears sound).
+        float pk = 0.0f;
+        for (int c = 0; c < juce::jmin (2, numIn); ++c) pk = juce::jmax (pk, buffer.getMagnitude (c, 0, total));
+        float prev = hostInPeak.load (std::memory_order_relaxed);
+        while (pk > prev && ! hostInPeak.compare_exchange_weak (prev, pk)) {}
+    }
+    else if (chunk > 0)
+    {
+        const juce::SpinLock::ScopedTryLockType tl (procLock); // never wait on the host audio thread
+        if (tl.isLocked())
         {
-            const int n = juce::jmin (chunk, total - start);
-            const float m0 = bypassMix;
-            const float m1 = target > m0 ? juce::jmin (target, m0 + step * (float) n) : juce::jmax (target, m0 - step * (float) n);
-            bypassMix = m1;
-            if (m0 >= 1.0f && m1 >= 1.0f)
-                pushSilence (n);                         // fully bypassed: keep the Atmos stream fed with silence
-            else
-                processChunk (buffer, start, n, 1.0f - m0, 1.0f - m1);
+            const int nHost = juce::jmin (numHostInputs.load (std::memory_order_relaxed), kMaxInputs);
+            for (int start = 0; start < total; start += chunk)
+            {
+                const int n = juce::jmin (chunk, total - start);
+                for (int i = 0; i < nHost; ++i)
+                {
+                    const int idx = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
+                    srcPtrs[(size_t) i] = (idx >= 0 && idx < numIn) ? buffer.getReadPointer (idx, start) : nullptr;
+                }
+                processSource (srcPtrs.data(), nHost, n);
+            }
         }
+    }
 
     // Normally the audio leaves through Windows Spatial Audio (HDMI) only: the host gets silence,
     // so nothing is played twice (the host output only provides the clock).
     // BYPASS: the host input passes through unchanged.
     for (int c = numIn; c < buffer.getNumChannels(); ++c) buffer.clear (c, 0, total);
-    if (mixStart <= 0.0f && bypassMix <= 0.0f)
+    if (hostStart <= 0.0f && hostMix <= 0.0f)
         buffer.clear();
-    else if (! (mixStart >= 1.0f && bypassMix >= 1.0f))
-        for (int c = 0; c < numIn; ++c) buffer.applyGainRamp (c, 0, total, mixStart, bypassMix);
+    else if (! (hostStart >= 1.0f && hostMix >= 1.0f))
+        for (int c = 0; c < numIn; ++c) buffer.applyGainRamp (c, 0, total, hostStart, hostMix);
+}
+
+void AtmosBridgeProcessor::processSource (const float* const* src, int numSrc, int n)
+{
+    // BYPASS crossfade on the Atmos side (20 ms)
+    const float target = bypassParam->load (std::memory_order_relaxed) > 0.5f ? 1.0f : 0.0f;
+    const float step = (float) (1.0 / (0.020 * currentSampleRate));
+    const float m0 = atmosMix;
+    const float m1 = target > m0 ? juce::jmin (target, m0 + step * (float) n) : juce::jmax (target, m0 - step * (float) n);
+    atmosMix = m1;
+    if (m0 >= 1.0f && m1 >= 1.0f)
+        pushSilence (n);                         // fully bypassed: keep the Atmos stream fed with silence
+    else
+        processChunk (src, numSrc, n, 1.0f - m0, 1.0f - m1);
+}
+
+//==============================================================================
+void AtmosBridgeProcessor::onDirectPacket (const float* inter, int frames, int ch, double lateMs, bool silent)
+{
+    // Level of the loopback (first two channels) for the silent-loopback check
+    float pk = 0.0f;
+    if (! silent)
+        for (int f = 0; f < frames; ++f)
+            for (int c = 0; c < juce::jmin (2, ch); ++c) pk = juce::jmax (pk, std::abs (inter[(size_t) f * (size_t) ch + (size_t) c]));
+    float prev = directInPeak.load (std::memory_order_relaxed);
+    while (pk > prev && ! directInPeak.compare_exchange_weak (prev, pk)) {}
+
+    if (! directActive.load (std::memory_order_acquire)) return;
+    const juce::SpinLock::ScopedLockType sl (procLock);
+    if (! directActive.load (std::memory_order_acquire) || ! prepared) return;
+    auto* s = getSharedOutput();
+    if (s == nullptr) return;
+
+    s->feeder.producerReportLateness (lateMs);
+    const int chunk = directIn.getNumSamples();
+    const int nch = juce::jmin (ch, kMaxInputs, directIn.getNumChannels());
+    for (int off = 0; off < frames; off += chunk)
+    {
+        const int n = juce::jmin (chunk, frames - off);
+        for (int c = 0; c < nch; ++c)
+        {
+            float* d = directIn.getWritePointer (c);
+            const float* p = inter + (size_t) off * (size_t) ch + (size_t) c;
+            for (int i = 0; i < n; ++i) d[i] = p[(size_t) i * (size_t) ch];
+            srcPtrs[(size_t) c] = d;
+        }
+        processSource (srcPtrs.data(), nch, n);
+    }
+}
+
+void AtmosBridgeProcessor::activateDirect()
+{
+    auto* s = getSharedOutput();
+    if (s == nullptr) return;
+    {
+        const juce::SpinLock::ScopedLockType sl (procLock); // waits for a host block in progress
+        s->feeder.producerPrepare (currentSampleRate, juce::roundToInt (currentSampleRate / 100.0));
+        s->feeder.setAdaptive (true);
+        directActive.store (true, std::memory_order_release);
+    }
+    silentStrikes = 0;
+    directReason.clear();
+    logLine ("Ultra low latency: direct loopback ON (" + (loopback ? loopback->getDeviceName() : std::string()) + ")");
+}
+
+void AtmosBridgeProcessor::deactivateDirect (const juce::String& reason, int retryMs)
+{
+    const bool was = directActive.load();
+    {
+        const juce::SpinLock::ScopedLockType sl (procLock); // waits for a loopback packet in progress
+        directActive.store (false, std::memory_order_release);
+        if (auto* s = getSharedOutput())
+        {
+            s->feeder.setAdaptive (false);
+            s->feeder.producerPrepare (currentSampleRate, currentBlockSize);
+        }
+    }
+    directRetryAtMs = juce::Time::getMillisecondCounter() + (juce::uint32) juce::jmax (0, retryMs);
+    if (was) logLine ("Ultra low latency: direct loopback OFF -> host input (" + reason.toStdString() + ")");
+}
+
+void AtmosBridgeProcessor::updateDirect()
+{
+    using DS = DirectStatus;
+    auto* s = getSharedOutput();
+    const bool want = s != nullptr && prepared && getMode() == LatencyMode::Ultra && directSourceId != "host";
+
+    DirectStatus st;
+    if (! want)
+    {
+        if (directActive.load()) deactivateDirect ("not in ultra low latency mode", 0);
+        if (loopback && loopback->isStarted()) { loopback->stop(); logLine ("Direct loopback stopped"); }
+        startedSource = "?";
+        directReason.clear();
+        setDirectStatus (st);
+        return;
+    }
+
+    if (loopback == nullptr) loopback = std::make_unique<LoopbackCapture>();
+    if (! loopback->isStarted() || startedSource != directSourceId)
+    {
+        if (directActive.load()) deactivateDirect ("input device changed", 0);
+        loopback->start (directSourceId.toStdString(), s->engine.getDeviceName(),
+                         [this] (const float* d, int f, int c, double late, bool silent) { onDirectPacket (d, f, c, late, silent); });
+        startedSource = directSourceId;
+        directRetryAtMs = 0;
+        silentStrikes = 0;
+    }
+
+    const auto ls = loopback->getStatus();
+    juce::String problem;
+    int retryMs = 3000;
+    bool connecting = false;
+    const auto tr = [] (const char* u) { return juce::String::fromUTF8 (u); };
+    if (ls == LoopbackStatus::Unsupported)        problem = tr ("이 시스템에서는 직접 루프백을 쓸 수 없음");
+    else if (ls == LoopbackStatus::NoDevice)      problem = tr ("입력 장치(CABLE In 16ch)를 찾지 못함");
+    else if (ls == LoopbackStatus::Error)         problem = tr ("루프백 오류: ") + juce::String (loopback->getLastError());
+    else if (ls != LoopbackStatus::Running)       { problem = tr ("연결 중"); connecting = true; }
+    else if (std::abs (loopback->getSampleRate() - currentSampleRate) > 1.0)
+        problem = tr ("샘플레이트가 호스트와 다름 (") + juce::String (loopback->getSampleRate(), 0) + " Hz)";
+    else if (LoopbackCapture::nowUs() - loopback->getLastPacketUs() > 300000)
+        problem = tr ("루프백 데이터가 끊김");
+
+    // Once a second: the host hears sound but the loopback stays digitally silent (e.g. exclusive-mode player)
+    if (++silentTick >= 10)
+    {
+        silentTick = 0;
+        const float hostPk = hostInPeak.exchange (0.0f), dirPk = directInPeak.exchange (0.0f);
+        silentStrikes = (directActive.load() && hostPk > 0.003f && dirPk < 1.0e-6f) ? silentStrikes + 1 : 0;
+    }
+    if (problem.isEmpty() && silentStrikes >= 2)
+    {
+        problem = tr ("루프백에 소리가 없음 (플레이어가 독점 모드?)");
+        retryMs = 10000;
+        silentStrikes = 0;
+    }
+
+    if (problem.isNotEmpty())
+    {
+        if (directActive.load()) deactivateDirect (problem, retryMs);
+        directReason = problem;
+    }
+    else if (! directActive.load() && juce::Time::getMillisecondCounter() >= directRetryAtMs)
+    {
+        activateDirect();
+    }
+
+    st.source = juce::String::fromUTF8 (loopback->getDeviceName().c_str());
+    st.reason = directReason;
+    st.marginMs = s->feeder.getMarginMs();
+    if (directActive.load())
+    {
+        st.settleSec = s->feeder.getSettleRemainingSec();
+        st.state = st.settleSec > 0.0 ? DS::Settling : DS::Running;
+        st.latencyMs = s->feeder.getState() == OutputFeeder::State::Running ? (double) s->feeder.getLatencyMs() : 0.0;
+    }
+    else
+    {
+        st.state = connecting ? DS::Settling : DS::Fallback;
+        st.settleSec = connecting ? OutputFeeder::kAdaptSettleS : 0.0;
+    }
+    setDirectStatus (st);
 }
 
 void AtmosBridgeProcessor::pushSilence (int n)
@@ -273,9 +467,8 @@ void AtmosBridgeProcessor::pushSilence (int n)
     }
 }
 
-void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int start, int n, float atmosGain0, float atmosGain1)
+void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, int n, float atmosGain0, float atmosGain1)
 {
-    const int numIn = juce::jmin (getTotalNumInputChannels(), buffer.getNumChannels());
     const double sr = currentSampleRate;
 
     // Test signals
@@ -305,6 +498,7 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
     //    - an upmixer slot is on (and not bypassed): host channels 1-2 -> upmixer -> inputs 1..12
     //      (L R C LFE SBL SBR SL SR TFL TFR TRL TRR)
     //    - otherwise: host channel n -> input n
+    //    (src = host channels, or the loopback channels in the ultra low latency mode)
     if (testActive)
     {
         for (int i = 0; i < kNumChannels; ++i)
@@ -318,12 +512,9 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
     }
     else if (const int ah = activeHost.load (std::memory_order_acquire); ah >= 0 && hosts[(size_t) ah]->isActive())
     {
-        auto hostPtr = [&] (int i) -> const float*
-        {
-            const int src = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
-            return (src >= 0 && src < numIn) ? buffer.getReadPointer (src, start) : nullptr;
-        };
-        if (! hosts[(size_t) ah]->process (hostPtr (0), hostPtr (1), inPtrs.data(), n))
+        const float* l = numSrc > 0 ? src[0] : nullptr;
+        const float* r = numSrc > 1 ? src[1] : nullptr;
+        if (! hosts[(size_t) ah]->process (l, r, inPtrs.data(), n))
             for (int i = 0; i < kNumChannels; ++i)
                 juce::FloatVectorOperations::clear (inPtrs[(size_t) i], n); // upmixer being swapped
     }
@@ -332,9 +523,8 @@ void AtmosBridgeProcessor::processChunk (juce::AudioBuffer<float>& buffer, int s
         for (int i = 0; i < kNumChannels; ++i)
         {
             float* dst = inPtrs[(size_t) i];
-            const int src = hostToJuce[(size_t) i].load (std::memory_order_relaxed);
-            if (src >= 0 && src < numIn)
-                juce::FloatVectorOperations::copy (dst, buffer.getReadPointer (src, start), n);
+            if (i < numSrc && src[i] != nullptr)
+                juce::FloatVectorOperations::copy (dst, src[i], n);
             else
                 juce::FloatVectorOperations::clear (dst, n);
         }
@@ -565,6 +755,13 @@ void AtmosBridgeProcessor::setOutputDeviceId (const juce::String& id)
         s->engine.setDeviceId (id.toStdString());
     writeExtrasToState();
     logLine ("Output device set to: " + (id.isEmpty() ? std::string ("<auto>") : id.toStdString()));
+}
+
+void AtmosBridgeProcessor::setDirectSourceId (const juce::String& id)
+{
+    directSourceId = id;
+    writeExtrasToState();
+    logLine ("Ultra low latency input: " + (id.isEmpty() ? std::string ("<auto: CABLE In 16ch>") : id.toStdString()));
 }
 
 void AtmosBridgeProcessor::setUiScale (float s)
@@ -802,6 +999,7 @@ void AtmosBridgeProcessor::writeExtrasToState()
     s.setProperty ("outputDevice", outputDeviceId, nullptr);
     s.setProperty ("uiScale", uiScale, nullptr);
     s.setProperty ("theme", (int) theme, nullptr);
+    s.setProperty ("directSource", directSourceId, nullptr);
     s.setProperty ("stateVersion", 3, nullptr);
 
     // While a restore is still pending, the slots that are about to be loaded are what we save.
@@ -833,6 +1031,7 @@ void AtmosBridgeProcessor::readExtrasFromState()
     applyLiveMap (live);
 
     uiScale = juce::jlimit (0.5f, 1.5f, (float) s.getProperty ("uiScale", uiScale));
+    directSourceId = s.getProperty ("directSource", "").toString();
 
     // Theme: the one last chosen on this PC wins; the project's own value is used when there is none.
     const int userTheme = readUserTheme();

@@ -7,6 +7,7 @@
 
 #include "RingBuffer.h"
 #include "SincResampler.h"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -29,10 +30,27 @@ public:
     static constexpr double kLowMaxExtraMs   = 60.0;  // Low mode grows by 10 ms per dropout, up to +60 ms
     static constexpr double kUltraMarginMs   = 4.5;
 
+    // Adaptive margin (ultra low latency with the direct loopback input): instead of a fixed margin,
+    // the margin follows the measured jitter of the input packets so the output never runs dry.
+    //  - first 2 minutes: 15 ms while the jitter of this PC is measured
+    //  - then: the worst jitter of the last 10 minutes (+1.5 ms), never less; a near miss grows it at once
+    //  - every change is made by a tiny speed change (max 0.3 %), never by skipping or inserting audio
+    //  - if the input still runs dry, the gap is concealed (the last 10 ms mirrored and faded) instead of
+    //    a silent gap and a re-prime, and the margin grows by the shortfall
+    static constexpr double kAdaptStartMs = 15.0;
+    static constexpr double kAdaptSettleS = 120.0;
+    static constexpr double kAdaptMinMs   = 1.0;
+    static constexpr double kAdaptMaxMs   = 25.0;
+    static constexpr double kNearMissMs   = 0.75;
+    static constexpr double kAdaptHoldS   = 600.0;
+    static constexpr int    kJitBuckets   = 10;     // 10 x 60 s
+
     explicit OutputFeeder (int numChannels) : numCh (numChannels)
     {
         ring.init (numCh, 1 << 16);
         resampler.setup (numCh, 1 << 16);
+        lastOut.assign ((size_t) numCh, std::vector<float> (8192, 0.0f));
+        for (auto& b : jitBucket) b.store (0.0f);
     }
 
     //==================================================== producer (host audio thread)
@@ -54,6 +72,8 @@ public:
 
         // A host that processes the same block twice in a row would make every block play twice:
         // detect identical, back-to-back, non-silent blocks and drop the copy.
+        // (Not with the direct loopback input: after a stall its packets arrive back-to-back by design.)
+        if (! adaptiveReq.load (std::memory_order_relaxed))
         {
             uint64_t h = 1469598103934665603ull;
             float energy = 0.0f;
@@ -82,7 +102,46 @@ public:
             overflowCount.fetch_add (1, std::memory_order_relaxed);
     }
 
+    // Producer: lateness of the packet just pushed (ms). The constant part is removed (slowly rising minimum),
+    // what remains is the jitter; the worst value per minute is kept for 10 minutes.
+    void producerReportLateness (double lateMs) noexcept
+    {
+        if (latenessReset.exchange (false, std::memory_order_acquire)) { minLate = 1e9; curBucket = -1; }
+        if (lateMs < minLate) minLate = lateMs;
+        else minLate += 0.0005;   // follows a rising baseline (0.05 ms/s at 100 packets/s)
+        const float jitter = (float) std::max (0.0, lateMs - minLate);
+        const int b = (int) ((nowMicros() / 60000000) % kJitBuckets);
+        if (b != curBucket) { curBucket = b; jitBucket[(size_t) b].store (0.0f, std::memory_order_relaxed); }
+        auto& slot = jitBucket[(size_t) b];
+        float prev = slot.load (std::memory_order_relaxed);
+        while (jitter > prev && ! slot.compare_exchange_weak (prev, jitter, std::memory_order_relaxed)) {}
+    }
+
     //==================================================== settings (any thread)
+    void setAdaptive (bool on) noexcept
+    {
+        adaptiveReq.store (on, std::memory_order_relaxed);
+        adaptiveChanged.store (true, std::memory_order_release);
+        if (on)
+        {
+            for (auto& b : jitBucket) b.store (0.0f, std::memory_order_relaxed);
+            latenessReset.store (true, std::memory_order_release);
+        }
+    }
+    bool isAdaptive() const noexcept { return adaptiveOn.load (std::memory_order_relaxed); }
+    double getSettleRemainingSec (int64_t now = nowMicros()) const noexcept
+    {
+        if (! adaptiveOn.load()) return 0.0;
+        return std::max (0.0, (double) (settleUntilUs.load() - now) * 1e-6);
+    }
+    double getMaxJitterMs() const noexcept
+    {
+        float m = 0.0f;
+        for (auto& b : jitBucket) m = std::max (m, b.load (std::memory_order_relaxed));
+        return m;
+    }
+    uint32_t getConcealed() const noexcept { return concealed.load(); }
+
     void setMode (int newMode) noexcept
     {
         newMode = std::clamp (newMode, 0, 2);
@@ -98,7 +157,8 @@ public:
         {
             case 0:  return kMusicMarginMs;
             case 1:  return kLowMarginMs + lowExtraMs.load (std::memory_order_relaxed);
-            default: return kUltraMarginMs;
+            default: return adaptiveOn.load (std::memory_order_relaxed) ? adaptMarginMs.load (std::memory_order_relaxed)
+                                                                         : kUltraMarginMs;
         }
     }
 
@@ -120,6 +180,21 @@ public:
         const double hr = hostSampleRate.load();
         const double baseRatio = hr / outRate;
         updateCutoff (baseRatio);
+
+        if (adaptiveChanged.exchange (false, std::memory_order_acquire))
+        {
+            const bool on = adaptiveReq.load (std::memory_order_relaxed);
+            adaptiveOn.store (on, std::memory_order_relaxed);
+            if (on)
+            {
+                adaptMarginMs.store (kAdaptStartMs);
+                floorMs = kAdaptStartMs;
+                holdUntilUs = nowUs + (int64_t) (kAdaptSettleS * 1e6);
+                settleUntilUs.store (holdUntilUs);
+                winMin = 1e9; winN = 0; concealRun = 0;
+            }
+        }
+        const bool adaptive = adaptiveOn.load (std::memory_order_relaxed) && mode.load (std::memory_order_relaxed) == 2;
 
         const int64_t sincePushUs = nowUs - lastPushUs.load (std::memory_order_relaxed);
         const bool producerAlive = sincePushUs < 300000;
@@ -202,12 +277,32 @@ public:
         const double dead = 8.0;
         const double e = (err > dead) ? err - dead : (err < -dead ? err + dead : 0.0);
         integ = std::clamp (integ + e / hr * 1e-4, -0.0005, 0.0005);
-        double correction = e / (8.0 * hr) + integ;  // drains the error over ~8 s
-        correction = std::clamp (correction, -0.001, 0.001);
+        // Drains the error over ~8 s; with the adaptive margin over ~1.5 s, so a raised margin is refilled
+        // quickly (still at most 0.3 % speed change, which is inaudible).
+        double correction = e / ((adaptive ? 1.5 : 8.0) * hr) + integ;
+        // Refilling a raised margin (more than 3 ms short) may use 0.5 %, otherwise 0.3 % / 0.1 %.
+        const double maxCorr = adaptive ? (e < -0.003 * hr ? 0.005 : 0.003) : 0.001;
+        correction = std::clamp (correction, -maxCorr, maxCorr);
         const double ratio = baseRatio * (1.0 + correction);
 
         const int need = resampler.framesNeeded (numOut, ratio);
-        if (need > ring.availableToRead() || need > resampler.spaceAvailable())
+        const int avail = ring.availableToRead();
+        if (adaptive && need > avail && need <= resampler.spaceAvailable() && concealRun < 3)
+        {
+            // Not enough input: conceal this period instead of a silent gap + re-prime,
+            // and grow the margin by the shortfall (kept for 10 minutes).
+            dropouts.fetch_add (1, std::memory_order_relaxed);
+            concealed.fetch_add (1, std::memory_order_relaxed);
+            ++concealRun;
+            const double shortMs = 1000.0 * (double) (need - avail) / hr;
+            const double m = std::min (kAdaptMaxMs, adaptMarginMs.load() + shortMs + 3.0);
+            adaptMarginMs.store (m);
+            floorMs = m;
+            holdUntilUs = nowUs + (int64_t) (kAdaptHoldS * 1e6);
+            conceal (out, numOut);
+            return;
+        }
+        if (need > avail || need > resampler.spaceAvailable())
         {
             // Underrun: not enough input. Output silence and re-prime.
             dropouts.fetch_add (1, std::memory_order_relaxed);
@@ -226,6 +321,55 @@ public:
             resampler.commitAppended (got);
         }
         resampler.process (out, numOut, ratio);
+        concealRun = 0;
+        if (fadeInPending)
+        {
+            const int nf = std::min (numOut, 64);
+            for (int c = 0; c < numCh; ++c)
+                for (int i = 0; i < nf; ++i) out[c][i] *= (float) i / (float) nf;
+            fadeInPending = false;
+        }
+        if (numOut <= (int) lastOut[0].size())
+        {
+            for (int c = 0; c < numCh; ++c) std::copy (out[c], out[c] + numOut, lastOut[(size_t) c].begin());
+            lastN = numOut;
+        }
+
+        if (adaptive)
+        {
+            // A packet later than ever seen before: raise the margin now (not at the next 30 s check).
+            const double needNow = getMaxJitterMs() + 1.5;
+            if (needNow > adaptMarginMs.load())
+            {
+                const double m = std::min (kAdaptMaxMs, needNow);
+                adaptMarginMs.store (m);
+                floorMs = std::max (floorMs, m);
+                holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (kAdaptHoldS * 1e6));
+            }
+
+            // Headroom right before this read; a near miss grows the margin before anything is heard.
+            const double slackMs = 1000.0 * (double) (avail - need) / hr;
+            if (slackMs < kNearMissMs)
+            {
+                const double m = std::min (kAdaptMaxMs, adaptMarginMs.load() + 1.0);
+                adaptMarginMs.store (m);
+                floorMs = std::max (floorMs, m - 1.0);
+                holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (kAdaptHoldS * 1e6));
+            }
+            winMin = std::min (winMin, slackMs);
+            if (++winN >= 3000) // ~30 s
+            {
+                // The margin is exactly the headroom left right before the next packet is due, so it has to
+                // cover the worst lateness seen (+1.5 ms).
+                const double needMs = std::clamp (getMaxJitterMs() + 1.5, kAdaptMinMs, kAdaptMaxMs);
+                if (nowUs > holdUntilUs) floorMs = needMs;
+                double m = adaptMarginMs.load();
+                if (winMin > 2.0) m = std::max (std::max (floorMs, needMs), m - 0.3 * (winMin - 1.5));
+                adaptMarginMs.store (std::clamp (std::max (m, needMs), kAdaptMinMs, kAdaptMaxMs));
+                winMin = 1e9;
+                winN = 0;
+            }
+        }
 
         // Plugin-side latency (what an impulse actually takes, measured in simulation):
         // every sample waits one host block plus the real queue in front of it; the "virtual" fill already
@@ -270,6 +414,24 @@ private:
         for (int c = 0; c < numCh; ++c) std::fill (out[c], out[c] + n, 0.0f);
     }
 
+    // The last output period played backwards (continuous at the joint) with a raised-cosine fade-out;
+    // the next real period fades in. Much less audible than a silent gap.
+    void conceal (float* const* out, int n) noexcept
+    {
+        if (lastN <= 0) { silence (out, n); fadeInPending = true; return; }
+        for (int c = 0; c < numCh; ++c)
+        {
+            const auto& src = lastOut[(size_t) c];
+            for (int i = 0; i < n; ++i)
+            {
+                const int k = lastN - 1 - (i % lastN);
+                const float g = 0.5f * (1.0f + std::cos (3.14159265f * (float) i / (float) n));
+                out[c][i] = src[(size_t) k] * g;
+            }
+        }
+        fadeInPending = true;
+    }
+
     void updateCutoff (double baseRatio) noexcept
     {
         // Downsampling needs the anti-alias cutoff at the output Nyquist.
@@ -293,6 +455,18 @@ private:
     std::atomic<int> mode { 0 };
     std::atomic<bool> modeChanged { false };
     std::atomic<double> lowExtraMs { 0.0 };
+
+    // adaptive margin
+    std::atomic<bool> adaptiveReq { false }, adaptiveChanged { false }, adaptiveOn { false }, latenessReset { false };
+    std::atomic<double> adaptMarginMs { kAdaptStartMs };
+    std::atomic<int64_t> settleUntilUs { 0 };
+    std::array<std::atomic<float>, kJitBuckets> jitBucket;
+    std::atomic<uint32_t> concealed { 0 };
+    double minLate = 1e9; int curBucket = -1;               // producer only
+    double floorMs = kAdaptStartMs, winMin = 1e9;           // consumer only
+    int64_t holdUntilUs = 0; int winN = 0, concealRun = 0, lastN = 0;
+    bool fadeInPending = false;
+    std::vector<std::vector<float>> lastOut;
 
     // consumer-only
     double outRate = 48000.0, smoothFill = -1.0, integ = 0.0, burstScore = 0.0;

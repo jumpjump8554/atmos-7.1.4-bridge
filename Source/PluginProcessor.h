@@ -5,6 +5,7 @@
 #include "dsp/Dsp.h"
 #include "dsp/OutputFeeder.h"
 #include "engine/SpatialEngine.h"
+#include "engine/LoopbackCapture.h"
 #include "UpmixerHost.h"
 
 #include <array>
@@ -88,6 +89,20 @@ public:
     Meter takeInputMeter (int input) noexcept;
     Meter takePositionMeter (int position) noexcept;
 
+    // Ultra low latency input: direct WASAPI loopback of the device the player plays to (CABLE In 16ch),
+    // instead of the host's own capture. Self-tuning margin; falls back to the host input on any problem.
+    struct DirectStatus
+    {
+        enum State { Off = 0, Settling, Running, Fallback };
+        int state = Off;
+        double marginMs = 0.0, latencyMs = 0.0, settleSec = 0.0;
+        juce::String source, reason;
+    };
+    DirectStatus getDirectStatus() const { const juce::ScopedLock sl (directLock); return directStatus; }
+    void setDirectStatus (const DirectStatus& st) { const juce::ScopedLock sl (directLock); directStatus = st; }
+    juce::String getDirectSourceId() const { return directSourceId; }   // "" = automatic (CABLE In 16ch), "host" = off
+    void setDirectSourceId (const juce::String& id);
+
     // Output device ("" = automatic)
     juce::String getOutputDeviceId() const { return outputDeviceId; }
     void setOutputDeviceId (const juce::String& id);
@@ -150,8 +165,15 @@ private:
     void updateChannelTable();
     void writeExtrasToState();
     void readExtrasFromState();
-    void processChunk (juce::AudioBuffer<float>& buffer, int start, int num, float atmosGain0, float atmosGain1);
+    void processChunk (const float* const* src, int numSrc, int num, float atmosGain0, float atmosGain1);
+    void processSource (const float* const* src, int numSrc, int num); // BYPASS ramp + processChunk / silence
     void pushSilence (int num);
+
+    // Ultra low latency input (direct loopback)
+    void onDirectPacket (const float* interleaved, int frames, int channels, double lateMs, bool silent);
+    void updateDirect();                                           // message thread, every timer tick
+    void activateDirect();
+    void deactivateDirect (const juce::String& reason, int retryMs);
     void setParam (const juce::String& id, float plainValue);
 
     using Map = std::array<int, ab::kNumChannels>;
@@ -175,7 +197,8 @@ private:
     std::atomic<float>* modeParam = nullptr;
     std::atomic<float>* limiterParam = nullptr;
     std::atomic<float>* bypassParam = nullptr;
-    float bypassMix = 0.0f;   // audio thread: 0 = Atmos Bridge active, 1 = bypassed
+    float atmosMix = 0.0f;    // processing thread: BYPASS ramp of the Atmos side (0 = active, 1 = bypassed)
+    float hostMix = 0.0f;     // host audio thread: BYPASS ramp of the host pass-through
 
     std::array<std::atomic<int>, ab::kNumChannels> outMap;
     std::array<std::atomic<int>, ab::kMaxInputs> hostToJuce;   // host channel index -> JUCE buffer index
@@ -220,9 +243,35 @@ private:
     PendingRestore pendingRestore;   // restored state, applied on the message thread
 
     ab::ThemeId theme = ab::ThemeId::Cyberpunk;
+    juce::String directSourceId;
+    juce::CriticalSection directLock;
+    DirectStatus directStatus;
+
+    // Direct loopback: the capture thread runs the same processing as the host thread does otherwise.
+    // procLock makes sure only one of them processes at a time (the host thread never waits for it).
+    std::unique_ptr<ab::LoopbackCapture> loopback;
+    std::atomic<bool> directActive { false };
+    juce::SpinLock procLock;
+    bool prepared = false;
+    juce::AudioBuffer<float> directIn;
+    std::array<const float*, ab::kMaxInputs> srcPtrs {};
+    std::atomic<float> hostInPeak { 0.0f }, directInPeak { 0.0f };
+    juce::String startedSource { "?" }, directReason;
+    juce::uint32 directRetryAtMs = 0;
+    int silentStrikes = 0, silentTick = 0;
+
+public:
+   #if AB_TEST_HOOKS
+    // Linux test harness only: drive the direct path without a Windows loopback device.
+    bool testNoAutoDirect = false;
+    void testSetDirect (bool on) { testNoAutoDirect = true; if (on) activateDirect(); else deactivateDirect ("test", 0); }
+    void testDirectPacket (const float* inter, int frames, int ch, double lateMs) { onDirectPacket (inter, frames, ch, lateMs, false); }
+    bool testIsDirectActive() const noexcept { return directActive.load(); }
+   #endif
+private:
     juce::String outputDeviceId;
     float uiScale = 0.75f;
-    int statTick = 0;
+    int statTick = 0, latencyTick = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AtmosBridgeProcessor)
 };
