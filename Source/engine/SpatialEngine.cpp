@@ -252,29 +252,45 @@ struct SpatialEngine::Impl
         client.Reset();
     }
 
-    // Auto: the default output if it has spatial sound, otherwise an HDMI/receiver-like device with spatial
-    // sound, otherwise any device with spatial sound. (The default output is often the virtual cable.)
+    // Auto: never a virtual cable (the host captures from it -> feedback loop). Among devices with spatial sound:
+    // an HDMI/receiver-like device first, then the default output, then any other.
     ComPtr<IMMDevice> pickAutoDevice()
     {
-        ComPtr<IMMDevice> def;
-        if (SUCCEEDED (enumerator->GetDefaultAudioEndpoint (eRender, eConsole, &def)) && def && spatialAvailable (def.Get()))
-            return def;
+        std::wstring defaultId;
+        {
+            ComPtr<IMMDevice> def;
+            if (SUCCEEDED (enumerator->GetDefaultAudioEndpoint (eRender, eConsole, &def)) && def)
+            {
+                LPWSTR id = nullptr;
+                if (SUCCEEDED (def->GetId (&id)) && id) { defaultId = id; CoTaskMemFree (id); }
+            }
+        }
 
         ComPtr<IMMDeviceCollection> coll;
         if (FAILED (enumerator->EnumAudioEndpoints (eRender, DEVICE_STATE_ACTIVE, &coll)) || ! coll)
             return {};
         UINT count = 0;
         coll->GetCount (&count);
-        ComPtr<IMMDevice> firstAny;
+        ComPtr<IMMDevice> hdmi, def, other;
         for (UINT i = 0; i < count; ++i)
         {
             ComPtr<IMMDevice> d;
             if (FAILED (coll->Item (i, &d)) || ! d) continue;
+            const std::string name = deviceFriendlyName (d.Get());
+            if (SpatialEngine::isVirtualDeviceName (name)) continue;
             if (! spatialAvailable (d.Get())) continue;
-            if (looksLikeHdmi (deviceFriendlyName (d.Get()))) return d;
-            if (! firstAny) firstAny = d;
+
+            LPWSTR id = nullptr;
+            std::wstring wid;
+            if (SUCCEEDED (d->GetId (&id)) && id) { wid = id; CoTaskMemFree (id); }
+
+            if (! hdmi && looksLikeHdmi (name)) hdmi = d;
+            else if (! def && ! defaultId.empty() && wid == defaultId) def = d;
+            else if (! other) other = d;
         }
-        return firstAny;
+        if (hdmi) return hdmi;
+        if (def) return def;
+        return other;
     }
 
     // Best effort: keep the real-time buffers in physical memory (no page faults on the output thread).
@@ -326,7 +342,7 @@ struct SpatialEngine::Impl
             if (! device)
             {
                 setStatus (EngineStatus::SpatialOff,
-                           "No output device has a spatial sound format enabled. Select 'Dolby Atmos for home theater' for the AV receiver.");
+                           "No output device (other than virtual cables) has a spatial sound format enabled. Select 'Dolby Atmos for home theater' for the AV receiver, or pick the receiver in the device list.");
                 return false;
             }
         }

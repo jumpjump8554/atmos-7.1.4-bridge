@@ -871,13 +871,15 @@ private:
         deviceIds.clear();
         device.clear (juce::dontSendNotification);
         deviceIds.add ({});
-        device.addItem (tr ("자동 (공간 음향 켜진 장치)"), 1);
+        device.addItem (tr ("자동 (공간 음향 켜진 AVR/HDMI, 가상 케이블 제외)"), 1);
         const auto list = SpatialEngine::listOutputDevices();
         int id = 2;
         for (const auto& d : list)
         {
             deviceIds.add (juce::String::fromUTF8 (d.id.c_str()));
-            device.addItem (juce::String::fromUTF8 (d.name.c_str()), id++);
+            device.addItem (juce::String::fromUTF8 (d.name.c_str())
+                                + (SpatialEngine::isVirtualDeviceName (d.name) ? tr (" (가상 케이블: 피드백 주의)") : juce::String()),
+                            id++);
         }
         const auto want = proc.getOutputDeviceId();
         if (want.isNotEmpty() && ! deviceIds.contains (want))
@@ -904,8 +906,17 @@ private:
             switch (st)
             {
                 case EngineStatus::Running:
-                    statusColour = col::neon;
-                    statusText = tr ("출력 중 \xc2\xb7 ") + name;
+                    if (SpatialEngine::isVirtualDeviceName (s->engine.getDeviceName()))
+                    {
+                        // The host captures from the virtual cable: output there loops back (feedback, no sound at the AVR).
+                        statusColour = col::amber;
+                        statusText = tr ("가상 케이블로 출력 중: 장치를 AVR로 선택하세요");
+                    }
+                    else
+                    {
+                        statusColour = col::neon;
+                        statusText = tr ("출력 중 \xc2\xb7 ") + name;
+                    }
                     break;
                 case EngineStatus::Connecting:
                     statusColour = col::amber;

@@ -5,6 +5,7 @@
 
 #include "../dsp/OutputFeeder.h"
 #include <atomic>
+#include <cctype>
 #include <memory>
 #include <string>
 #include <vector>
@@ -53,6 +54,17 @@ public:
     bool isMemoryLocked() const noexcept;
 
     static std::vector<OutputDevice> listOutputDevices();
+
+    // Virtual audio cables (VB-Audio, VoiceMeeter, ...): the host usually captures from these,
+    // so sending the Atmos output there creates a feedback loop. Never picked automatically.
+    static bool isVirtualDeviceName (const std::string& name)
+    {
+        std::string n = name;
+        for (auto& ch : n) ch = (char) std::tolower ((unsigned char) ch);
+        for (const char* key : { "cable", "vb-audio", "voicemeeter", "virtual" })
+            if (n.find (key) != std::string::npos) return true;
+        return false;
+    }
 
     struct Impl;
 private:
