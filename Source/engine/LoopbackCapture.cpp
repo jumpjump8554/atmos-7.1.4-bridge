@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <set>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -40,6 +41,13 @@ bool LoopbackCapture::isAutoCandidate (const std::string& friendlyName, bool str
     for (auto& c : n) c = (char) std::tolower ((unsigned char) c);
     if (strict) return n.find ("cable in 16ch") != std::string::npos;
     return n.find ("cable in") != std::string::npos;
+}
+
+bool LoopbackCapture::isVirtualCable (const std::string& friendlyName)
+{
+    std::string n = friendlyName;
+    for (auto& c : n) c = (char) std::tolower ((unsigned char) c);
+    return n.find ("vb-audio") != std::string::npos;
 }
 } // namespace ab
 
@@ -107,6 +115,14 @@ std::string friendlyName (IMMDevice* d)
     return name;
 }
 
+std::string idOf (IMMDevice* d)
+{
+    LPWSTR w = nullptr;
+    std::string id;
+    if (SUCCEEDED (d->GetId (&w)) && w != nullptr) { id = utf8 (w); CoTaskMemFree (w); }
+    return id;
+}
+
 const GUID kSubFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 const GUID kSubPcm   = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 
@@ -156,8 +172,35 @@ struct LoopbackCapture::Impl
     std::atomic<bool> keeperOk { false };
 
     // short engine period (Ultra low latency+)
-    bool wantShort = false, shortAllowed = true, shortChecked = false;
-    std::atomic<bool> shortActive { false };
+    bool wantShort = false, shortAllowed = true, shortChecked = false, restartNow = false, reopenAtOnce = false;
+    std::atomic<bool> shortActive { false }, trialPending { false };
+    std::string deviceId;
+
+    // Devices on which the short period was tried without effect (this host session): never asked again.
+    static std::mutex& noShortLock() { static std::mutex m; return m; }
+    static std::set<std::string>& noShortDevices() { static std::set<std::string> s; return s; }
+    static bool isNoShort (const std::string& id)
+    {
+        std::lock_guard<std::mutex> g (noShortLock());
+        return noShortDevices().count (id) > 0;
+    }
+    static void rememberNoShort (const std::string& id)
+    {
+        std::lock_guard<std::mutex> g (noShortLock());
+        noShortDevices().insert (id);
+    }
+    // Devices on which the short period did shorten the packets: no new trial when reopened.
+    static std::set<std::string>& shortOkDevices() { static std::set<std::string> s; return s; }
+    static bool isShortOk (const std::string& id)
+    {
+        std::lock_guard<std::mutex> g (noShortLock());
+        return shortOkDevices().count (id) > 0;
+    }
+    static void rememberShortOk (const std::string& id)
+    {
+        std::lock_guard<std::mutex> g (noShortLock());
+        shortOkDevices().insert (id);
+    }
     std::atomic<int> periodNote { 0 };
     int64_t shortSinceUs = 0;
     std::atomic<UINT32> defaultPeriod { 0 };
@@ -250,8 +293,22 @@ struct LoopbackCapture::Impl
         // Silence keeper first: a silent render stream on the same endpoint keeps the engine (and the loopback)
         // running; with the short period requested it sets the engine period before the loopback stream opens.
         device = dev;
+        deviceId = idOf (dev.Get());
         mixCopy.assign (reinterpret_cast<const uint8_t*> (mix), reinterpret_cast<const uint8_t*> (mix) + sizeof (WAVEFORMATEX) + mix->cbSize);
-        openKeeper (wantShort && shortAllowed);
+        bool tryShort = wantShort && shortAllowed;
+        if (tryShort && LoopbackCapture::isVirtualCable (name))
+        {
+            tryShort = false;
+            periodNote.store ((int) PeriodNote::SkippedVirtual);
+            logLine ("Direct loopback: short engine period not requested (VB-Audio cable: packets stay 10 ms)");
+        }
+        else if (tryShort && isNoShort (deviceId))
+        {
+            tryShort = false;
+            periodNote.store ((int) PeriodNote::SkippedKnown);
+            logLine ("Direct loopback: short engine period not requested (no effect on this device before)");
+        }
+        openKeeper (tryShort);
 
         // Event-driven loopback; the 100 ms buffer only holds data if this thread is ever late (no added latency).
         hr = capClient->Initialize (AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -297,6 +354,7 @@ struct LoopbackCapture::Impl
         keepClient.Reset();
         keeperOk.store (false);
         shortActive.store (false);
+        trialPending.store (false);
     }
 
     // Silent render stream; with tryShort it first asks for a ~5 ms engine period (IAudioClient3).
@@ -313,6 +371,7 @@ struct LoopbackCapture::Impl
                 || FAILED (c3->GetSharedModeEnginePeriod (mix, &def, &fund, &mn, &mx)) || fund == 0)
             {
                 periodNote.store ((int) PeriodNote::Unsupported);
+                rememberNoShort (deviceId);
             }
             else
             {
@@ -322,6 +381,7 @@ struct LoopbackCapture::Impl
                 if (mn >= def || period >= def || period > mx)
                 {
                     periodNote.store ((int) PeriodNote::Unsupported);
+                    rememberNoShort (deviceId);
                     logLine ("Direct loopback: short engine period not offered by the driver (default " + std::to_string (def)
                              + ", min " + std::to_string (mn) + " frames)");
                 }
@@ -333,7 +393,8 @@ struct LoopbackCapture::Impl
                         keepClient = c3;
                         shortActive.store (true);
                         shortSinceUs = nowUs();
-                        shortChecked = false;
+                        shortChecked = isShortOk (deviceId);          // proven before: no new trial
+                        trialPending.store (! shortChecked);
                         periodNote.store ((int) PeriodNote::Active);
                         logLine ("Direct loopback: short engine period " + std::to_string (period) + " frames requested (default "
                                  + std::to_string (def) + ")");
@@ -341,6 +402,7 @@ struct LoopbackCapture::Impl
                     else
                     {
                         periodNote.store ((int) (hr == AUDCLNT_E_ENGINE_PERIODICITY_LOCKED ? PeriodNote::Locked : PeriodNote::Failed));
+                        if (hr != AUDCLNT_E_ENGINE_PERIODICITY_LOCKED) rememberNoShort (deviceId);
                         logLine ("Direct loopback: short engine period refused " + hex (hr));
                     }
                 }
@@ -369,23 +431,30 @@ struct LoopbackCapture::Impl
         }
     }
 
-    // After ~3 s with the short period: if the loopback packets did not get shorter, go back to the normal
-    // period (only the silent keeper stream is reopened; the capture stream keeps running).
+    // After ~3 s with the short period (a trial: the input is not used yet): if the loopback packets did not
+    // get shorter, reopen BOTH streams at the normal period. Reopening only the keeper is not enough: the
+    // capture stream opened during the short period keeps an irregular packet timing.
     void checkShortPeriod()
     {
         if (! shortActive.load() || shortChecked || nowUs() - shortSinceUs < 3000000) return;
-        shortChecked = true;
         const int frames = typicalPacketFrames();
+        if (frames <= 0) return;                // no packets yet: decide when there are some
+        shortChecked = true;
         if (frames > 0 && defaultPeriod > 0 && (UINT32) frames * 4 > defaultPeriod * 3)
         {
             logLine ("Direct loopback: loopback packets stay at " + std::to_string (frames)
-                     + " frames with the short period -> back to the normal period");
+                     + " frames with the short period -> reopening at the normal period (device not asked again)");
             shortAllowed = false;
-            openKeeper (false);
+            rememberNoShort (deviceId);
             periodNote.store ((int) PeriodNote::NoEffect);
+            restartNow = true;              // run(): status "Starting", close and reopen right away
         }
         else
+        {
             logLine ("Direct loopback: loopback packets " + std::to_string (frames) + " frames with the short period");
+            rememberShortOk (deviceId);
+            trialPending.store (false);
+        }
     }
 
     int typicalPacketFrames() const noexcept
@@ -517,6 +586,7 @@ struct LoopbackCapture::Impl
                 if (stopFlag.load()) break;
                 topUpSilence();
                 checkShortPeriod();
+                if (restartNow) { restartNow = false; reopenAtOnce = true; setStatus (LoopbackStatus::Starting); break; }
                 if (w == WAIT_TIMEOUT && ++quiet < 100) { if (! drain()) break; continue; }
                 quiet = 0;
                 if (! drain()) break;
@@ -527,6 +597,7 @@ struct LoopbackCapture::Impl
                 }
             }
             close();
+            if (reopenAtOnce) { reopenAtOnce = false; continue; }
             if (! stopFlag.load()) WaitForSingleObject (wakeEvent, 500);
         }
 
@@ -556,6 +627,9 @@ void LoopbackCapture::start (const std::string& sourceId, const std::string& exc
     stop();
     impl->wantShort = shortPeriod;
     impl->shortAllowed = true;
+    impl->restartNow = false;
+    impl->reopenAtOnce = false;
+    impl->trialPending.store (false);
     impl->periodNote.store (0);
     for (auto& f : impl->pktFrames) f.store (0);
     impl->sourceId = sourceId;
@@ -601,6 +675,7 @@ bool LoopbackCapture::isShortPeriodActive() const noexcept
     return f > 0 && (UINT32) f * 4 <= impl->defaultPeriod * 3;
 }
 LoopbackCapture::PeriodNote LoopbackCapture::getPeriodNote() const noexcept { return (PeriodNote) impl->periodNote.load(); }
+bool LoopbackCapture::isPeriodTrialPending() const noexcept { return impl->trialPending.load(); }
 } // namespace ab
 
 //==============================================================================
@@ -627,6 +702,7 @@ double LoopbackCapture::getPacketMs() const noexcept { return 0.0; }
 int LoopbackCapture::getPacketFrames() const noexcept { return 0; }
 bool LoopbackCapture::isShortPeriodActive() const noexcept { return false; }
 LoopbackCapture::PeriodNote LoopbackCapture::getPeriodNote() const noexcept { return PeriodNote::NotRequested; }
+bool LoopbackCapture::isPeriodTrialPending() const noexcept { return false; }
 } // namespace ab
 
 #endif

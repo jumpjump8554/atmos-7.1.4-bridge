@@ -418,6 +418,7 @@ void AtmosBridgeProcessor::updateDirect()
     else if (ls == LoopbackStatus::NoDevice)      problem = tr ("입력 장치(CABLE In 16ch)를 찾지 못함");
     else if (ls == LoopbackStatus::Error)         problem = tr ("루프백 오류: ") + juce::String (loopback->getLastError());
     else if (ls != LoopbackStatus::Running)       { problem = tr ("연결 중"); connecting = true; }
+    else if (loopback->isPeriodTrialPending())    { problem = tr ("CABLE In 짧은 주기 시험 중 (3초)"); connecting = true; }
     else if (std::abs (loopback->getSampleRate() - currentSampleRate) > 1.0)
         problem = tr ("샘플레이트가 호스트와 다름 (") + juce::String (loopback->getSampleRate(), 0) + " Hz)";
     else if (LoopbackCapture::nowUs() - loopback->getLastPacketUs() > 300000)
@@ -473,8 +474,10 @@ void AtmosBridgeProcessor::updateDirect()
             case PN::Active:      st.periodNote = st.shortPeriod ? juce::String() : tr ("짧은 주기 확인 중"); break;
             case PN::Unsupported: st.periodNote = tr ("드라이버가 짧은 주기 미지원"); break;
             case PN::Locked:      st.periodNote = tr ("다른 앱이 주기를 고정함"); break;
-            case PN::NoEffect:    st.periodNote = tr ("패킷이 짧아지지 않아 기본 주기 사용"); break;
+            case PN::NoEffect:    st.periodNote = tr ("패킷이 짧아지지 않아 기본 주기로 다시 열고, 다시 요청 안 함"); break;
             case PN::Failed:      st.periodNote = tr ("짧은 주기 요청 실패"); break;
+            case PN::SkippedVirtual: st.periodNote = tr ("VB-Cable은 짧은 주기를 지원하지 않아 요청 안 함"); break;
+            case PN::SkippedKnown:   st.periodNote = tr ("이 장치는 짧은 주기 효과가 없어 요청 안 함"); break;
             case PN::NotRequested: default: break;
         }
     }
