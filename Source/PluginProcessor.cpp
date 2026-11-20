@@ -873,7 +873,23 @@ AtmosBridgeProcessor::SlotView AtmosBridgeProcessor::getSlot (int index) const
     v.bypass = e.bypass;
     v.active = index == activeSlot;
     v.latencyMs = info.loaded ? 1000.0 * info.latencySamples / juce::jmax (1.0, currentSampleRate) : 0.0;
+   #if AB_TEST_HOOKS
+    if (testSlotName[(size_t) index].isNotEmpty())
+    {
+        v.name = testSlotName[(size_t) index];
+        v.latencyMs = testSlotLatency[(size_t) index];
+        v.layout = juce::String::fromUTF8 ("Stereo \xe2\x86\x92 7.1.4 Surround (12ch)");
+    }
+   #endif
     return v;
+}
+
+void AtmosBridgeProcessor::setOutputFormat (ab::OutputFormat f)
+{
+    if ((int) f == outputFormat.load()) return;
+    outputFormat.store ((int) f);
+    ++formatVersion;
+    logLine (std::string ("Output format: ") + (f == ab::OutputFormat::Stereo ? "2ch Stereo" : "Atmos"));
 }
 
 bool AtmosBridgeProcessor::addUpmixer (const juce::String& path, juce::String& error)

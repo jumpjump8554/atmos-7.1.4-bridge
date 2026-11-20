@@ -153,6 +153,25 @@ public:
     double getUpmixerLatencyMs() const noexcept;    // latency of the upmixer that is running now
     int getSlotsVersion() const noexcept { return slotsVersion; } // changes whenever the slot list changes
 
+    //========================================================================== output format + 2ch plugins (v1.5)
+    ab::OutputFormat getOutputFormat() const noexcept { return (ab::OutputFormat) outputFormat.load(); }
+    void setOutputFormat (ab::OutputFormat f);
+    int getFormatVersion() const noexcept { return formatVersion.load(); }
+    struct FxView
+    {
+        juce::String name, layout, error;
+        bool loaded = false, bypass = false;
+        double latencyMs = 0.0;
+    };
+    int getNumFx() const noexcept { return (int) fxViews.size(); }
+    FxView getFx (int index) const { return index >= 0 && index < (int) fxViews.size() ? fxViews[(size_t) index] : FxView(); }
+    int getFxVersion() const noexcept { return fxVersion; }
+   #if AB_TEST_HOOKS
+    void testSetFx (std::vector<FxView> v) { fxViews = std::move (v); ++fxVersion; }
+    std::array<juce::String, ab::kMaxUpmixers> testSlotName;   // display overrides (UI previews)
+    std::array<double, ab::kMaxUpmixers> testSlotLatency {};
+   #endif
+
     bool isOutputOwner() const noexcept { return ownsOutput.load (std::memory_order_acquire); }
     SharedOutput* getSharedOutput() const noexcept { return isOutputOwner() ? shared.get() : nullptr; }
     double getHostSampleRate() const noexcept { return currentSampleRate; }
@@ -171,6 +190,10 @@ private:
     void processChunk (const float* const* src, int numSrc, int num, float atmosGain0, float atmosGain1);
     void processSource (const float* const* src, int numSrc, int num); // BYPASS ramp + processChunk / silence
     void pushSilence (int num);
+
+    std::atomic<int> outputFormat { 0 }, formatVersion { 0 };
+    std::vector<FxView> fxViews;
+    int fxVersion = 0;
 
     // Direct loopback input (Low latency / Ultra low latency+)
     void onDirectPacket (const float* interleaved, int frames, int channels, double lateMs, bool silent);
