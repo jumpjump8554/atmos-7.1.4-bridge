@@ -2,7 +2,6 @@
 #include "Platform.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -24,8 +23,6 @@ const char* toString (EngineStatus s) noexcept
         case EngineStatus::NoDevice:    return "NoDevice";
         case EngineStatus::Error:       return "Error";
         case EngineStatus::Unsupported: return "Unsupported";
-        case EngineStatus::Busy:        return "Busy";
-        case EngineStatus::ExclusiveOff: return "ExclusiveOff";
     }
     return "?";
 }
@@ -49,16 +46,8 @@ const char* toString (EngineStatus s) noexcept
 #include <mmreg.h>
 #include <avrt.h>
 #include <wrl/client.h>
-#include "SpatialFormat.h"
 
 using Microsoft::WRL::ComPtr;
-
-#ifndef AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED
- #define AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED AUDCLNT_ERR (0x00e)
-#endif
-#ifndef AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
- #define AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED AUDCLNT_ERR (0x019)
-#endif
 
 namespace ab
 {
@@ -231,17 +220,6 @@ struct SpatialEngine::Impl
     std::vector<std::vector<float>> convertBuf;
     std::atomic<bool> usingDefault { true };
     std::atomic<bool> memLocked { false };
-
-    // 2ch Stereo (WASAPI exclusive)
-    std::atomic<bool> stereoWanted { false }, stereoActive { false };
-    ComPtr<IAudioClient> exClient;
-    ComPtr<IAudioRenderClient> exRender;
-    UINT32 exFrames = 0;
-    SampleKind exKind = SampleKind::Int32;
-    int exBytes = 4;
-    std::vector<std::vector<float>> exBuf;
-    std::string spatialTriedFor;      // device on which turning on Dolby Atmos for home theater was tried
-    DWORD spatialTriedAt = 0;
     std::vector<std::pair<const void*, size_t>> locked;
 
     void setStatus (EngineStatus s, const std::string& err = {})
@@ -272,34 +250,12 @@ struct SpatialEngine::Impl
         for (auto& o : objects) o.Reset();
         stream.Reset();
         client.Reset();
-        if (exClient) exClient->Stop();
-        exRender.Reset();
-        exClient.Reset();
-        stereoActive.store (false);
-    }
-
-    // Atmos: spatial sound is off for this device -> try to select "Dolby Atmos for home theater"
-    // (at most once a minute per device). Windows may refuse it; then the user selects it by hand.
-    void tryEnableAtmos (IMMDevice* dev)
-    {
-        const std::string id = deviceId (dev);
-        const DWORD now = GetTickCount();
-        if (id == spatialTriedFor && now - spatialTriedAt < 60000) return;
-        spatialTriedFor = id;
-        spatialTriedAt = now;
-        const auto r = enableDolbyAtmosForHomeTheater (toWide (id));
-        logLine ("Turning on 'Dolby Atmos for home theater' for \"" + deviceFriendlyName (dev) + "\": " + toString (r));
     }
 
     // Auto: never a virtual cable (the host captures from it -> feedback loop). Among devices with spatial sound:
     // an HDMI/receiver-like device first, then the default output, then any other.
-    // requireSpatial = false (2ch / turning spatial sound on): devices without spatial sound are accepted too
-    // (still preferring the ones with it).
-    ComPtr<IMMDevice> pickAutoDevice (bool requireSpatial = true)
+    ComPtr<IMMDevice> pickAutoDevice()
     {
-        if (! requireSpatial)
-            if (auto d = pickAutoDevice (true)) return d;
-
         std::wstring defaultId;
         {
             ComPtr<IMMDevice> def;
@@ -322,7 +278,7 @@ struct SpatialEngine::Impl
             if (FAILED (coll->Item (i, &d)) || ! d) continue;
             const std::string name = deviceFriendlyName (d.Get());
             if (SpatialEngine::isVirtualDeviceName (name)) continue;
-            if (requireSpatial && ! spatialAvailable (d.Get())) continue;
+            if (! spatialAvailable (d.Get())) continue;
 
             LPWSTR id = nullptr;
             std::wstring wid;
@@ -369,8 +325,7 @@ struct SpatialEngine::Impl
     {
         // Keep NoDevice / SpatialOff / Error visible (and the log quiet) while retrying every 2 s.
         const auto cur = (EngineStatus) status.load();
-        if (cur != EngineStatus::NoDevice && cur != EngineStatus::SpatialOff && cur != EngineStatus::Error
-            && cur != EngineStatus::Busy && cur != EngineStatus::ExclusiveOff)
+        if (cur != EngineStatus::NoDevice && cur != EngineStatus::SpatialOff && cur != EngineStatus::Error)
             setStatus (EngineStatus::Connecting);
         std::string wanted;
         {
@@ -379,19 +334,15 @@ struct SpatialEngine::Impl
         }
         usingDefault.store (wanted.empty());
 
-        const bool stereo = stereoWanted.load();
         ComPtr<IMMDevice> device;
         HRESULT hr = S_OK;
         if (usingDefault.load())
         {
-            device = pickAutoDevice (! stereo);
+            device = pickAutoDevice();
             if (! device)
             {
-                if (! stereo)
-                    if (auto candidate = pickAutoDevice (false)) tryEnableAtmos (candidate.Get());
-                setStatus (stereo ? EngineStatus::NoDevice : EngineStatus::SpatialOff,
-                           stereo ? "No output device (other than virtual cables) found."
-                                  : "No output device (other than virtual cables) has a spatial sound format enabled. Select 'Dolby Atmos for home theater' for the AV receiver, or pick the receiver in the device list.");
+                setStatus (EngineStatus::SpatialOff,
+                           "No output device (other than virtual cables) has a spatial sound format enabled. Select 'Dolby Atmos for home theater' for the AV receiver, or pick the receiver in the device list.");
                 return false;
             }
         }
@@ -412,9 +363,6 @@ struct SpatialEngine::Impl
             deviceName = deviceFriendlyName (device.Get());
         }
 
-        if (stereo)
-            return connectExclusive (device.Get());
-
         hr = device->Activate (__uuidof (ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**) client.ReleaseAndGetAddressOf());
         if (FAILED (hr) || ! client)
         {
@@ -432,7 +380,6 @@ struct SpatialEngine::Impl
         if (FAILED (avail))
         {
             client.Reset();
-            tryEnableAtmos (device.Get());
             setStatus (EngineStatus::SpatialOff,
                        "Spatial sound is off for this device (" + hrToString (avail) + "). Select 'Dolby Atmos for home theater' in Windows sound settings.");
             return false;
@@ -514,154 +461,6 @@ struct SpatialEngine::Impl
                        (unsigned) f->nSamplesPerSec, (unsigned) f->wBitsPerSample, (unsigned) maxDyn, (unsigned) nativeMask);
         logLine (info + std::string ("  device=\"") + getName() + "\"");
         setStatus (EngineStatus::Running);
-        return true;
-    }
-
-    // 2ch Stereo: the device in WASAPI exclusive mode, PCM 2.0, event driven, one device period per buffer.
-    bool connectExclusive (IMMDevice* device)
-    {
-        HRESULT hr = device->Activate (__uuidof (IAudioClient), CLSCTX_ALL, nullptr, (void**) exClient.ReleaseAndGetAddressOf());
-        if (FAILED (hr) || ! exClient)
-        {
-            setStatus (EngineStatus::Error, "IAudioClient activation failed " + hrToString (hr));
-            return false;
-        }
-
-        // Formats, preferred first: 24 bit in 32, 16 bit, 32 bit, float. Rates: 48 kHz first.
-        struct Candidate { DWORD rate; WORD container, valid; bool isFloat; SampleKind kind; };
-        const Candidate candidates[] = {
-            { 48000, 32, 24, false, SampleKind::Int32 }, { 48000, 16, 16, false, SampleKind::Int16 },
-            { 48000, 32, 32, false, SampleKind::Int32 }, { 48000, 32, 32, true,  SampleKind::Float32 },
-            { 44100, 32, 24, false, SampleKind::Int32 }, { 44100, 16, 16, false, SampleKind::Int16 },
-            { 96000, 32, 24, false, SampleKind::Int32 }, { 96000, 16, 16, false, SampleKind::Int16 },
-        };
-        WAVEFORMATEXTENSIBLE fmt {};
-        const Candidate* chosen = nullptr;
-        for (const auto& c : candidates)
-        {
-            WAVEFORMATEXTENSIBLE x {};
-            x.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
-            x.Format.nChannels = 2;
-            x.Format.nSamplesPerSec = c.rate;
-            x.Format.wBitsPerSample = c.container;
-            x.Format.nBlockAlign = (WORD) (2 * c.container / 8);
-            x.Format.nAvgBytesPerSec = c.rate * x.Format.nBlockAlign;
-            x.Format.cbSize = 22;
-            x.Samples.wValidBitsPerSample = c.valid;
-            x.dwChannelMask = 0x3; // front left | front right
-            x.SubFormat = c.isFloat ? kSubtypeFloat : kSubtypePcm;
-            if (exClient->IsFormatSupported (AUDCLNT_SHAREMODE_EXCLUSIVE, &x.Format, nullptr) == S_OK)
-            {
-                fmt = x;
-                chosen = &c;
-                break;
-            }
-        }
-        if (chosen == nullptr)
-        {
-            setStatus (EngineStatus::Error, "The device accepts none of the 2ch PCM formats (48/44.1/96 kHz) in exclusive mode");
-            exClient.Reset();
-            return false;
-        }
-
-        REFERENCE_TIME defPeriod = 0, minPeriod = 0;
-        exClient->GetDevicePeriod (&defPeriod, &minPeriod);
-        REFERENCE_TIME period = defPeriod > 0 ? defPeriod : 100000;
-        hr = exClient->Initialize (AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, period, &fmt.Format, nullptr);
-        if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
-        {
-            UINT32 aligned = 0;
-            exClient->GetBufferSize (&aligned);
-            period = (REFERENCE_TIME) (10000.0 * 1000.0 * aligned / fmt.Format.nSamplesPerSec + 0.5);
-            exClient.Reset();
-            hr = device->Activate (__uuidof (IAudioClient), CLSCTX_ALL, nullptr, (void**) exClient.ReleaseAndGetAddressOf());
-            if (SUCCEEDED (hr))
-                hr = exClient->Initialize (AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, period, period, &fmt.Format, nullptr);
-        }
-        if (FAILED (hr))
-        {
-            exClient.Reset();
-            if (hr == AUDCLNT_E_DEVICE_IN_USE)
-                setStatus (EngineStatus::Busy, "The device is in use by another application (" + hrToString (hr) + "). "
-                                               "Set the host's output to another device, or close the other application.");
-            else if (hr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED)
-                setStatus (EngineStatus::ExclusiveOff, "Exclusive mode is not allowed for this device (" + hrToString (hr) + "). "
-                                                       "Sound settings > device properties > Advanced: allow applications to take exclusive control.");
-            else
-                setStatus (EngineStatus::Error, "Exclusive 2ch Initialize failed " + hrToString (hr));
-            return false;
-        }
-
-        exClient->SetEventHandle (bufferEvent);
-        exClient->GetBufferSize (&exFrames);
-        hr = exClient->GetService (__uuidof (IAudioRenderClient), (void**) exRender.ReleaseAndGetAddressOf());
-        if (FAILED (hr) || ! exRender || exFrames == 0)
-        {
-            setStatus (EngineStatus::Error, "Exclusive render client failed " + hrToString (hr));
-            disconnect();
-            return false;
-        }
-        exKind = chosen->kind;
-        exBytes = chosen->container / 8;
-        exBuf.assign (12, std::vector<float> (std::max<size_t> (exFrames, 4096), 0.0f));
-
-        // Start with one buffer of silence (exclusive streams play the buffer as soon as they start).
-        BYTE* data = nullptr;
-        if (SUCCEEDED (exRender->GetBuffer (exFrames, &data)))
-            exRender->ReleaseBuffer (exFrames, AUDCLNT_BUFFERFLAGS_SILENT);
-
-        outRate.store ((double) fmt.Format.nSamplesPerSec);
-        periodFrames.store ((int) exFrames);
-        maxDynamic.store (0);
-        feeder.consumerStart ((double) fmt.Format.nSamplesPerSec);
-
-        hr = exClient->Start();
-        if (FAILED (hr))
-        {
-            setStatus (EngineStatus::Error, "Exclusive 2ch Start failed " + hrToString (hr));
-            disconnect();
-            return false;
-        }
-        stereoActive.store (true);
-
-        char info[256];
-        std::snprintf (info, sizeof (info), "Connected (2ch exclusive): %u Hz, %u-bit (in %u), buffer %u frames (%.1f ms)",
-                       (unsigned) fmt.Format.nSamplesPerSec, (unsigned) chosen->valid, (unsigned) chosen->container,
-                       (unsigned) exFrames, 1000.0 * exFrames / fmt.Format.nSamplesPerSec);
-        logLine (info + std::string ("  device=\"") + getName() + "\"");
-        setStatus (EngineStatus::Running);
-        return true;
-    }
-
-    // One exclusive period: the whole buffer. Returns false if the stream must be reconnected.
-    bool renderExclusive()
-    {
-        BYTE* data = nullptr;
-        HRESULT hr = exRender->GetBuffer (exFrames, &data);
-        if (FAILED (hr) || data == nullptr)
-        {
-            logLine ("Exclusive GetBuffer failed " + hrToString (hr) + " -> reconnect");
-            return false;
-        }
-        float* out[12];
-        for (int k = 0; k < 12; ++k) out[k] = exBuf[(size_t) k].data();
-        feeder.render (out, (int) exFrames);   // positions L/R carry the 2ch signal
-
-        for (UINT32 i = 0; i < exFrames; ++i)
-            for (int c = 0; c < 2; ++c)
-            {
-                const float v = std::max (-1.0f, std::min (1.0f, out[c][i]));
-                BYTE* p = data + ((size_t) i * 2 + (size_t) c) * (size_t) exBytes;
-                if (exKind == SampleKind::Float32)    *reinterpret_cast<float*> (p) = v;
-                else if (exKind == SampleKind::Int16) *reinterpret_cast<int16_t*> (p) = (int16_t) std::lrint (v * 32767.0f);
-                else                                  *reinterpret_cast<int32_t*> (p) = (int32_t) std::llrint ((double) v * 2147483647.0);
-            }
-        hr = exRender->ReleaseBuffer (exFrames, 0);
-        if (FAILED (hr))
-        {
-            logLine ("Exclusive ReleaseBuffer failed " + hrToString (hr) + " -> reconnect");
-            return false;
-        }
         return true;
     }
 
@@ -806,7 +605,7 @@ struct SpatialEngine::Impl
             }
             timeouts = 0;
 
-            if (! (stereoActive.load() ? renderExclusive() : renderOnce()))
+            if (! renderOnce())
             {
                 disconnect();
                 connected = false;
@@ -871,15 +670,6 @@ std::string SpatialEngine::getDeviceId() const
     std::lock_guard<std::mutex> g (impl->infoLock);
     return impl->deviceIdWanted;
 }
-
-void SpatialEngine::setStereo (bool stereo2ch)
-{
-    if (impl->stereoWanted.exchange (stereo2ch) == stereo2ch) return;
-    logLine (std::string ("Output: ") + (stereo2ch ? "2ch Stereo (exclusive)" : "Atmos (spatial audio)"));
-    requestReconnect();
-}
-
-bool SpatialEngine::isStereoActive() const noexcept { return impl->stereoActive.load(); }
 
 void SpatialEngine::requestReconnect()
 {
@@ -948,8 +738,6 @@ SpatialEngine::~SpatialEngine() = default;
 void SpatialEngine::start() {}
 void SpatialEngine::stop() {}
 void SpatialEngine::setDeviceId (const std::string&) {}
-void SpatialEngine::setStereo (bool) {}
-bool SpatialEngine::isStereoActive() const noexcept { return false; }
 std::string SpatialEngine::getDeviceId() const { return {}; }
 void SpatialEngine::requestReconnect() {}
 EngineStatus SpatialEngine::getStatus() const noexcept { return EngineStatus::Unsupported; }

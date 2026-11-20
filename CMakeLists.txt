@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.22)
 
-project (AtmosBridge VERSION 1.5.0 LANGUAGES C CXX)
+project (AtmosBridge VERSION 1.4.1 LANGUAGES C CXX)
 
 set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,7 +39,6 @@ target_sources (AtmosBridge PRIVATE
     Source/UpmixerHost.cpp
     Source/engine/SpatialEngine.cpp
     Source/engine/LoopbackCapture.cpp
-    Source/engine/SpatialFormat.cpp
     Source/engine/Platform.cpp)
 
 target_include_directories (AtmosBridge PRIVATE Source)
@@ -62,7 +61,7 @@ target_link_libraries (AtmosBridge
         juce::juce_recommended_warning_flags)
 
 if (WIN32)
-    target_link_libraries (AtmosBridge PRIVATE ole32 avrt shell32 uuid runtimeobject)
+    target_link_libraries (AtmosBridge PRIVATE ole32 avrt shell32 uuid)
 endif()
 
 if (MSVC)

@@ -20,11 +20,6 @@ constexpr double kLfeNoiseCutHz = 120.0;
 constexpr double kSequenceSeconds = 2.0; // time per position in the sequential test
 
 // Latency modes
-// Output format (v1.5): Atmos = Windows spatial audio (Dolby Atmos for home theater, 12 objects);
-// Stereo = PCM 2ch straight to the HDMI device (WASAPI exclusive) so the AVR's own upmixers can be used.
-enum class OutputFormat : int { Atmos = 0, Stereo = 1 };
-constexpr int kMaxFx = 3;     // 2ch plugins (applied in order before the upmixer / the 2ch output)
-
 enum class LatencyMode : int { Music = 0, Low = 1, Ultra = 2 };
 constexpr int kNumModes = 3;
 

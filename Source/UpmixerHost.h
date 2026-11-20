@@ -6,8 +6,6 @@
 // asks for stereo in -> 7.1.4 out (with fallbacks), and feeds the 12 channels straight into its own
 // input stage, re-ordered to L R C LFE SBL SBR SL SR TFL TFR TRL TRR when the layout names the channels.
 //
-// The same class also hosts the 2ch plugins (Stereo -> Stereo, e.g. XTC, EQ): kind Stereo, processStereo().
-//
 // Threading: load/unload/prepare/state = message thread. process() = audio thread (never blocks:
 // it uses a try-lock and reports "not available" while a load/unload is in progress).
 
@@ -18,7 +16,6 @@
 #include <atomic>
 #include <functional>
 #include <memory>
-#include <vector>
 
 class UpmixerHost
 {
@@ -32,8 +29,7 @@ public:
         int numOutputs = 0;
     };
 
-    enum class Kind { Upmixer, Stereo };
-    explicit UpmixerHost (Kind k = Kind::Upmixer);
+    UpmixerHost();
     ~UpmixerHost();
 
     // Message thread
@@ -62,24 +58,20 @@ public:
     bool isActive() const noexcept { return enabled.load() && loaded.load(); }
     bool process (const float* inL, const float* inR, float* const* dst, int numSamples) noexcept;
 
-    // Audio thread (kind Stereo): processes L/R in place. Returns false (untouched) if not available.
-    bool processStereo (float* l, float* r, int numSamples) noexcept;
-
 private:
     struct Slot
     {
         std::unique_ptr<juce::AudioPluginInstance> instance;
         juce::AudioBuffer<float> buffer;
         juce::MidiBuffer midi;
-        int numIn = 0, numOut = 0, inLeft = 0, inRight = 1, outLeft = 0, outRight = 1;
+        int numIn = 0, numOut = 0, inLeft = 0, inRight = 1;
         std::array<int, ab::kNumChannels> posToOut {};
     };
 
-    static bool negotiateLayout (juce::AudioPluginInstance& p, juce::String& layoutText, Kind kind);
+    static bool negotiateLayout (juce::AudioPluginInstance& p, juce::String& layoutText);
     static void computeRouting (Slot& s, bool& named);
     void prepareSlot (Slot& s);
 
-    const Kind kind;
     juce::AudioPluginFormatManager formats;
     std::unique_ptr<Slot> slot;
     juce::CriticalSection lock;

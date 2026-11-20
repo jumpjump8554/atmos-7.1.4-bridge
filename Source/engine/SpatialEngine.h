@@ -1,8 +1,6 @@
 #pragma once
 // Output engine: renders 12 static 7.1.4 objects through Windows' ISpatialAudioClient.
 // Windows' spatial renderer ("Dolby Atmos for home theater") encodes them (Dolby MAT over HDMI).
-// 2ch Stereo (v1.5): instead, the same device is opened in WASAPI exclusive mode as PCM 2.0 (positions L/R),
-// so the AV receiver gets plain stereo and can use its own upmixers.
 // Runs its own event-driven thread (MMCSS "Pro Audio"), reconnects automatically after device changes.
 
 #include "../dsp/OutputFeeder.h"
@@ -29,9 +27,7 @@ enum class EngineStatus : int
     SpatialOff,     // device found but no spatial sound format active (stream not available)
     NoDevice,       // selected device missing
     Error,          // other failure (see getLastError)
-    Unsupported,    // not Windows
-    Busy,           // 2ch: the device is used by another application (exclusive mode refused)
-    ExclusiveOff    // 2ch: exclusive mode is not allowed for this device (Windows sound settings)
+    Unsupported     // not Windows
 };
 
 class SpatialEngine
@@ -44,8 +40,6 @@ public:
     void stop();
 
     void setDeviceId (const std::string& endpointId); // "" = automatic (first device with spatial sound)
-    void setStereo (bool stereo2ch);                  // true = 2ch PCM, WASAPI exclusive (reconnects)
-    bool isStereoActive() const noexcept;             // the running connection is the 2ch exclusive one
     std::string getDeviceId() const;
     void requestReconnect();
 

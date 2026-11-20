@@ -8,7 +8,7 @@ namespace
 juce::String tr (const char* utf8) { return juce::String::fromUTF8 (utf8); }
 }
 
-UpmixerHost::UpmixerHost (Kind k) : kind (k)
+UpmixerHost::UpmixerHost()
 {
    #if JUCE_PLUGINHOST_VST3
     formats.addFormat (std::make_unique<juce::VST3PluginFormat>());
@@ -58,21 +58,20 @@ juce::Array<juce::File> UpmixerHost::findInstalledVst3()
 }
 
 //==============================================================================
-bool UpmixerHost::negotiateLayout (juce::AudioPluginInstance& p, juce::String& layoutText, Kind kind)
+bool UpmixerHost::negotiateLayout (juce::AudioPluginInstance& p, juce::String& layoutText)
 {
     using CS = juce::AudioChannelSet;
     const auto original = p.getBusesLayout();
     if (original.inputBuses.isEmpty() || original.outputBuses.isEmpty())
         return false;
 
-    // Upmixer, preferred first: stereo in -> 7.1.4 out (channels named, so they can be re-ordered automatically).
-    const std::vector<std::pair<CS, CS>> attempts = kind == Kind::Stereo
-        ? std::vector<std::pair<CS, CS>> { { CS::stereo(), CS::stereo() } }
-        : std::vector<std::pair<CS, CS>> {
-              { CS::stereo(),                CS::create7point1point4() },
-              { CS::stereo(),                CS::discreteChannels (12) },
-              { CS::create7point1point4(),   CS::create7point1point4() },
-              { CS::discreteChannels (12),   CS::discreteChannels (12) } };
+    // Preferred first: stereo in -> 7.1.4 out (channels named, so they can be re-ordered automatically).
+    const std::pair<CS, CS> attempts[] = {
+        { CS::stereo(),                CS::create7point1point4() },
+        { CS::stereo(),                CS::discreteChannels (12) },
+        { CS::create7point1point4(),   CS::create7point1point4() },
+        { CS::discreteChannels (12),   CS::discreteChannels (12) },
+    };
 
     for (const bool disableAux : { true, false })
         for (const auto& a : attempts)
@@ -93,10 +92,9 @@ bool UpmixerHost::negotiateLayout (juce::AudioPluginInstance& p, juce::String& l
             }
         }
 
-    // Nothing accepted: keep the plugin's own layout if it already has enough outputs.
+    // Nothing accepted: keep the plugin's own layout if it already has 12+ outputs.
     p.setBusesLayout (original);
-    if (kind == Kind::Stereo ? (p.getMainBusNumOutputChannels() >= 2 && p.getMainBusNumInputChannels() >= 1)
-                             : p.getMainBusNumOutputChannels() >= ab::kNumChannels)
+    if (p.getMainBusNumOutputChannels() >= ab::kNumChannels)
     {
         const auto in = p.getChannelLayoutOfBus (true, 0), out = p.getChannelLayoutOfBus (false, 0);
         layoutText = in.getDescription() + juce::String::fromUTF8 (" \xe2\x86\x92 ") + out.getDescription()
@@ -119,10 +117,6 @@ void UpmixerHost::computeRouting (Slot& s, bool& named)
     s.inRight = in.getChannelIndexForType (CS::right);
     if (s.inLeft < 0) s.inLeft = 0;
     if (s.inRight < 0) s.inRight = s.numIn > 1 ? 1 : 0;
-    s.outLeft = out.getChannelIndexForType (CS::left);
-    s.outRight = out.getChannelIndexForType (CS::right);
-    if (s.outLeft < 0) s.outLeft = 0;
-    if (s.outRight < 0) s.outRight = s.numOut > 1 ? 1 : 0;
 
     named = out.size() > 0 && ! out.isDiscreteLayout();
     if (! named)
@@ -208,12 +202,10 @@ bool UpmixerHost::load (const juce::String& path)
     }
 
     juce::String layoutText;
-    if (! negotiateLayout (*instance, layoutText, kind))
+    if (! negotiateLayout (*instance, layoutText))
     {
-        info.error = desc->name + (kind == Kind::Stereo ? tr (": 2채널(Stereo \xe2\x86\x92 Stereo) 구성을 받아들이지 않습니다")
-                                                        : tr (": 12채널 출력 구성을 받아들이지 않습니다"));
-        logLine (std::string (kind == Kind::Stereo ? "2ch plugin refused stereo layout: " : "Upmixer refused all 12-channel layouts: ")
-                 + desc->name.toStdString());
+        info.error = desc->name + tr (": 12채널 출력 구성을 받아들이지 않습니다");
+        logLine ("Upmixer refused all 12-channel layouts: " + desc->name.toStdString());
         return false;
     }
 
@@ -241,12 +233,6 @@ bool UpmixerHost::load (const juce::String& path)
     info = ni;
     loaded.store (true);
 
-    if (kind == Kind::Stereo)
-    {
-        logLine ("2ch plugin loaded: " + ni.name.toStdString() + " | " + layoutText.toStdString() + " | latency "
-                 + std::to_string (ni.latencySamples));
-        return true;
-    }
     juce::String routing;
     for (int pos = 0; pos < ab::kNumChannels; ++pos)
         routing << ab::kPosCodes[(size_t) pos] << "<-" << slot->posToOut[(size_t) pos] + 1 << " ";
@@ -277,7 +263,7 @@ void UpmixerHost::unload()
     }
     if (old != nullptr && old->instance != nullptr)
     {
-        logLine ((kind == Kind::Stereo ? "2ch plugin unloaded: " : "Upmixer unloaded: ") + old->instance->getName().toStdString());
+        logLine ("Upmixer unloaded: " + old->instance->getName().toStdString());
         old->instance->releaseResources();
     }
     old.reset();
@@ -354,39 +340,5 @@ bool UpmixerHost::process (const float* inL, const float* inR, float* const* dst
         if (o >= 0 && o < nch) juce::FloatVectorOperations::copy (dst[pos], view.getReadPointer (o), n);
         else                   juce::FloatVectorOperations::clear (dst[pos], n);
     }
-    return true;
-}
-
-bool UpmixerHost::processStereo (float* l, float* r, int n) noexcept
-{
-    if (! isActive()) return false;
-
-    const juce::ScopedTryLock tl (lock);
-    if (! tl.isLocked() || slot == nullptr) return false;
-
-    auto& s = *slot;
-    if (n > s.buffer.getNumSamples()) return false;
-
-    const int nch = s.buffer.getNumChannels();
-    for (int c = 0; c < nch; ++c)
-        juce::FloatVectorOperations::clear (s.buffer.getWritePointer (c), n);
-    if (s.numIn >= 2)
-    {
-        if (s.inLeft < nch)  juce::FloatVectorOperations::copy (s.buffer.getWritePointer (s.inLeft), l, n);
-        if (s.inRight < nch) juce::FloatVectorOperations::copy (s.buffer.getWritePointer (s.inRight), r, n);
-    }
-    else if (s.numIn == 1)
-    {
-        float* d = s.buffer.getWritePointer (0);
-        juce::FloatVectorOperations::addWithMultiply (d, l, 0.5f, n);
-        juce::FloatVectorOperations::addWithMultiply (d, r, 0.5f, n);
-    }
-
-    juce::AudioBuffer<float> view (s.buffer.getArrayOfWritePointers(), nch, n);
-    s.midi.clear();
-    s.instance->processBlock (view, s.midi);
-
-    if (s.outLeft < nch)  juce::FloatVectorOperations::copy (l, view.getReadPointer (s.outLeft), n);
-    if (s.outRight < nch) juce::FloatVectorOperations::copy (r, view.getReadPointer (s.outRight), n);
     return true;
 }

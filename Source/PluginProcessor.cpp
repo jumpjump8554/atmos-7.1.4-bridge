@@ -77,8 +77,6 @@ AtmosBridgeProcessor::AtmosBridgeProcessor()
     limiterParam = apvts.getRawParameterValue ("limiter");
     bypassParam = apvts.getRawParameterValue ("bypass");
     for (auto& h : hosts) h = std::make_unique<UpmixerHost>();
-    for (auto& h : fxHosts) h = std::make_unique<UpmixerHost> (UpmixerHost::Kind::Stereo);
-    for (auto& c : fxChain) c.store (-1);
 
     const int userTheme = readUserTheme();
     if (userTheme >= 0) theme = (ThemeId) userTheme;
@@ -99,8 +97,6 @@ AtmosBridgeProcessor::~AtmosBridgeProcessor()
     if (loopback) loopback->stop();
     activeHost.store (-1);
     for (auto& h : hosts) { h->beforeUnload = nullptr; h->unload(); }
-    for (auto& c : fxChain) c.store (-1);
-    for (auto& h : fxHosts) { h->beforeUnload = nullptr; h->unload(); }
     releaseOutput();
 }
 
@@ -115,7 +111,6 @@ void AtmosBridgeProcessor::tryClaimOutput()
     shared->feeder.producerPrepare (currentSampleRate, currentBlockSize);
     shared->feeder.setMode ((int) getMode());
     shared->engine.setDeviceId (outputDeviceId.toStdString());
-    shared->engine.setStereo (getOutputFormat() == OutputFormat::Stereo);
     shared->engine.start();
     ownsOutput.store (true, std::memory_order_release);
     logLine ("This instance owns the spatial (HDMI) output");
@@ -144,7 +139,6 @@ void AtmosBridgeProcessor::timerCallback()
     {
         bool latencyChanged = false;
         for (auto& h : hosts) latencyChanged = h->refreshLatency() || latencyChanged;
-        for (auto& h : fxHosts) latencyChanged = h->refreshLatency() || latencyChanged;
         if (latencyChanged) updateLatency();
     }
 
@@ -196,8 +190,6 @@ void AtmosBridgeProcessor::prepareToPlay (double sampleRate, int samplesPerBlock
     }
 
     for (auto& h : hosts) h->prepare (currentSampleRate, chunk);
-    for (auto& h : fxHosts) h->prepare (currentSampleRate, chunk);
-    fxWork.setSize (2, chunk, false, true, true);
     limiter.prepare (currentSampleRate, kLimiterCeilingDb);
     updateLatency();
 
@@ -253,6 +245,13 @@ void AtmosBridgeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
     const int chunk = inWork.getNumSamples();
     const int numIn = juce::jmin (getTotalNumInputChannels(), buffer.getNumChannels());
 
+    // BYPASS crossfade on the host side (20 ms): the original fades in here while the Atmos side fades out.
+    const float target = bypassParam->load (std::memory_order_relaxed) > 0.5f ? 1.0f : 0.0f;
+    const float step = (float) (1.0 / (0.020 * currentSampleRate));
+    const float hostStart = hostMix;
+    hostMix = target > hostMix ? juce::jmin (target, hostMix + step * (float) total)
+                               : juce::jmax (target, hostMix - step * (float) total);
+
     if (directActive.load (std::memory_order_acquire))
     {
         // Direct loopback (Low / Ultra+): the Atmos side runs on the loopback thread. Here only the host input level
@@ -281,22 +280,28 @@ void AtmosBridgeProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce:
         }
     }
 
-    // The audio leaves through Atmos Bridge's own output only (Atmos or 2ch): the host gets silence,
-    // so nothing is played twice (the host output only provides the clock). BYPASS too goes through
-    // Atmos Bridge's own output (the original input, unprocessed), so it also works when the host's output
-    // is another device (needed for 2ch Stereo, which takes the AV receiver exclusively).
-    buffer.clear();
+    // Normally the audio leaves through Windows Spatial Audio (HDMI) only: the host gets silence,
+    // so nothing is played twice (the host output only provides the clock).
+    // BYPASS: the host input passes through unchanged.
+    for (int c = numIn; c < buffer.getNumChannels(); ++c) buffer.clear (c, 0, total);
+    if (hostStart <= 0.0f && hostMix <= 0.0f)
+        buffer.clear();
+    else if (! (hostStart >= 1.0f && hostMix >= 1.0f))
+        for (int c = 0; c < numIn; ++c) buffer.applyGainRamp (c, 0, total, hostStart, hostMix);
 }
 
 void AtmosBridgeProcessor::processSource (const float* const* src, int numSrc, int n)
 {
-    // BYPASS crossfade (20 ms) between the processed signal and the original input
+    // BYPASS crossfade on the Atmos side (20 ms)
     const float target = bypassParam->load (std::memory_order_relaxed) > 0.5f ? 1.0f : 0.0f;
     const float step = (float) (1.0 / (0.020 * currentSampleRate));
     const float m0 = atmosMix;
     const float m1 = target > m0 ? juce::jmin (target, m0 + step * (float) n) : juce::jmax (target, m0 - step * (float) n);
     atmosMix = m1;
-    processChunk (src, numSrc, n, m0, m1);
+    if (m0 >= 1.0f && m1 >= 1.0f)
+        pushSilence (n);                         // fully bypassed: keep the Atmos stream fed with silence
+    else
+        processChunk (src, numSrc, n, 1.0f - m0, 1.0f - m1);
 }
 
 //==============================================================================
@@ -507,28 +512,22 @@ void AtmosBridgeProcessor::pushSilence (int n)
     }
 }
 
-void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, int n, float raw0, float raw1)
+void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, int n, float atmosGain0, float atmosGain1)
 {
     const double sr = currentSampleRate;
-    const bool stereoOut = getOutputFormat() == OutputFormat::Stereo;   // 2ch: positions L/R only
-    const bool fullyRaw = raw0 >= 1.0f && raw1 >= 1.0f;                 // BYPASS: original input only
 
-    // Test signals (2ch: only L/R and inputs 1-2)
-    int iNoise = inputNoise.load (std::memory_order_relaxed);
+    // Test signals
+    const int iNoise = inputNoise.load (std::memory_order_relaxed);
     int pNoise = positionNoise.load (std::memory_order_relaxed);
-    if (stereoOut && iNoise > 1) iNoise = -1;
-    if (stereoOut && pNoise > 1) pNoise = -1;
     const bool seqOn = sequenceOn.load (std::memory_order_relaxed);
     if (seqOn)
     {
-        const int count = stereoOut ? 2 : kNumChannels;
         if (! seqWasOn) { seqSamples = 0.0; seqIndex = 0; }
-        if (seqIndex >= count) seqIndex = 0;
         seqSamples += n;
         if (seqSamples >= kSequenceSeconds * sr)
         {
             seqSamples = 0.0;
-            seqIndex = (seqIndex + 1) % count;
+            seqIndex = (seqIndex + 1) % kNumChannels;
         }
         sequencePos.store (seqIndex, std::memory_order_relaxed);
         pNoise = seqIndex;
@@ -538,118 +537,72 @@ void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, in
         sequencePos.store (-1, std::memory_order_relaxed);
     }
     seqWasOn = seqOn;
-    if (fullyRaw) iNoise = pNoise = -1;
     const bool testActive = iNoise >= 0 || pNoise >= 0;
 
     // 1) Inputs (program audio is silenced while a test signal plays)
-    //    - host channels 1-2 go through the 2ch plugins that are on (in order)
-    //    - 2ch Stereo: (processed) channels 1-2 -> inputs 1-2, nothing else
-    //    - an upmixer slot is on (and not bypassed): channels 1-2 -> upmixer -> inputs 1..12
+    //    - an upmixer slot is on (and not bypassed): host channels 1-2 -> upmixer -> inputs 1..12
     //      (L R C LFE SBL SBR SL SR TFL TFR TRL TRR)
     //    - otherwise: host channel n -> input n
     //    (src = host channels, or the loopback channels with the direct loopback input)
-    const float* l = numSrc > 0 ? src[0] : nullptr;
-    const float* r = numSrc > 1 ? src[1] : nullptr;
-    if (fullyRaw)
-    {
-        // BYPASS: no plugin runs; the inputs are only taken for the meters
-    }
-    else if (testActive)
+    if (testActive)
     {
         for (int i = 0; i < kNumChannels; ++i)
         {
             float* dst = inPtrs[(size_t) i];
             if (i == iNoise)
-                noise.read (dst, n, ! stereoOut && outMap[(size_t) i].load (std::memory_order_relaxed) == kLfePos);
+                noise.read (dst, n, outMap[(size_t) i].load (std::memory_order_relaxed) == kLfePos);
             else
                 juce::FloatVectorOperations::clear (dst, n);
         }
     }
+    else if (const int ah = activeHost.load (std::memory_order_acquire); ah >= 0 && hosts[(size_t) ah]->isActive())
+    {
+        const float* l = numSrc > 0 ? src[0] : nullptr;
+        const float* r = numSrc > 1 ? src[1] : nullptr;
+        if (! hosts[(size_t) ah]->process (l, r, inPtrs.data(), n))
+            for (int i = 0; i < kNumChannels; ++i)
+                juce::FloatVectorOperations::clear (inPtrs[(size_t) i], n); // upmixer being swapped
+    }
     else
     {
-        if (fxChain[0].load (std::memory_order_acquire) >= 0 && n <= fxWork.getNumSamples())
+        for (int i = 0; i < kNumChannels; ++i)
         {
-            float* fl = fxWork.getWritePointer (0);
-            float* fr = fxWork.getWritePointer (1);
-            if (l != nullptr) juce::FloatVectorOperations::copy (fl, l, n); else juce::FloatVectorOperations::clear (fl, n);
-            if (r != nullptr) juce::FloatVectorOperations::copy (fr, r, n); else juce::FloatVectorOperations::clear (fr, n);
-            for (int k = 0; k < kMaxFx; ++k)
-            {
-                const int h = fxChain[(size_t) k].load (std::memory_order_acquire);
-                if (h < 0) break;
-                fxHosts[(size_t) h]->processStereo (fl, fr, n);   // false while being swapped: passes unchanged
-            }
-            l = fl;
-            r = fr;
-        }
-
-        const int ah = activeHost.load (std::memory_order_acquire);
-        if (stereoOut)
-        {
-            for (int i = 0; i < kNumChannels; ++i)
-            {
-                const float* s = i == 0 ? l : i == 1 ? r : nullptr;
-                if (s != nullptr) juce::FloatVectorOperations::copy (inPtrs[(size_t) i], s, n);
-                else              juce::FloatVectorOperations::clear (inPtrs[(size_t) i], n);
-            }
-        }
-        else if (ah >= 0 && hosts[(size_t) ah]->isActive())
-        {
-            if (! hosts[(size_t) ah]->process (l, r, inPtrs.data(), n))
-                for (int i = 0; i < kNumChannels; ++i)
-                    juce::FloatVectorOperations::clear (inPtrs[(size_t) i], n); // upmixer being swapped
-        }
-        else
-        {
-            for (int i = 0; i < kNumChannels; ++i)
-            {
-                float* dst = inPtrs[(size_t) i];
-                const float* s = i == 0 ? l : i == 1 ? r : (i < numSrc ? src[i] : nullptr);
-                if (s != nullptr) juce::FloatVectorOperations::copy (dst, s, n);
-                else              juce::FloatVectorOperations::clear (dst, n);
-            }
+            float* dst = inPtrs[(size_t) i];
+            if (i < numSrc && src[i] != nullptr)
+                juce::FloatVectorOperations::copy (dst, src[i], n);
+            else
+                juce::FloatVectorOperations::clear (dst, n);
         }
     }
 
     // 2) Mute with a 10 ms ramp (also applies to the input test noise)
     const float step = (float) (1.0 / (0.010 * sr));
-    if (! fullyRaw)
-        for (int i = 0; i < kNumChannels; ++i)
+    for (int i = 0; i < kNumChannels; ++i)
+    {
+        const float target = muteParams[(size_t) i]->load (std::memory_order_relaxed) > 0.5f ? 0.0f : 1.0f;
+        float g = gainNow[(size_t) i];
+        float* dst = inPtrs[(size_t) i];
+        if (g == target)
         {
-            const float target = muteParams[(size_t) i]->load (std::memory_order_relaxed) > 0.5f ? 0.0f : 1.0f;
-            float g = gainNow[(size_t) i];
-            float* dst = inPtrs[(size_t) i];
-            if (g == target)
-            {
-                if (g == 0.0f) juce::FloatVectorOperations::clear (dst, n);
-                continue;
-            }
-            for (int k = 0; k < n; ++k)
-            {
-                g = (target > g) ? juce::jmin (target, g + step) : juce::jmax (target, g - step);
-                dst[k] *= g;
-            }
-            gainNow[(size_t) i] = g;
+            if (g == 0.0f) juce::FloatVectorOperations::clear (dst, n);
+            continue;
         }
+        for (int k = 0; k < n; ++k)
+        {
+            g = (target > g) ? juce::jmin (target, g + step) : juce::jmax (target, g - step);
+            dst[k] *= g;
+        }
+        gainNow[(size_t) i] = g;
+    }
 
-    // 3) Mapping: input i -> position outMap[i] (0 dB, no level change; duplicates are summed).
-    //    2ch Stereo: input 1 -> L, input 2 -> R.
+    // 3) Mapping: input i -> position outMap[i] (0 dB, no level change; duplicates are summed)
     for (int p = 0; p < kNumChannels; ++p)
         juce::FloatVectorOperations::clear (posPtrs[(size_t) p], n);
-    if (! fullyRaw)
+    for (int i = 0; i < kNumChannels; ++i)
     {
-        if (stereoOut)
-        {
-            juce::FloatVectorOperations::copy (posPtrs[0], inPtrs[0], n);
-            juce::FloatVectorOperations::copy (posPtrs[1], inPtrs[1], n);
-        }
-        else
-            for (int i = 0; i < kNumChannels; ++i)
-            {
-                const int p = outMap[(size_t) i].load (std::memory_order_relaxed);
-                if (p >= 0 && p < kNumChannels)
-                    juce::FloatVectorOperations::add (posPtrs[(size_t) p], inPtrs[(size_t) i], n);
-            }
+        const int p = outMap[(size_t) i].load (std::memory_order_relaxed);
+        if (p >= 0 && p < kNumChannels)
+            juce::FloatVectorOperations::add (posPtrs[(size_t) p], inPtrs[(size_t) i], n);
     }
 
     // 4) Position test noise (speaker click / sequential test): straight to the position
@@ -660,31 +613,6 @@ void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, in
         noise.read (posPtrs[(size_t) pNoise], n, pNoise == kLfePos);
     }
     noise.advance (n);
-
-    // BYPASS: crossfade to the original input, host channel n -> position n (2ch: channels 1-2 -> L/R)
-    if (raw0 > 0.0f || raw1 > 0.0f)
-    {
-        const int count = stereoOut ? 2 : kNumChannels;
-        const float d = (raw1 - raw0) / (float) n;
-        for (int p = 0; p < kNumChannels; ++p)
-        {
-            float* x = posPtrs[(size_t) p];
-            const float* s = (p < count && p < numSrc) ? src[p] : nullptr;
-            if (fullyRaw)
-            {
-                if (s != nullptr) juce::FloatVectorOperations::copy (x, s, n);
-                else              juce::FloatVectorOperations::clear (x, n);
-                if (s != nullptr) juce::FloatVectorOperations::copy (inPtrs[(size_t) p], s, n);   // meters
-                else              juce::FloatVectorOperations::clear (inPtrs[(size_t) p], n);
-                continue;
-            }
-            for (int k = 0; k < n; ++k)
-            {
-                const float g = raw0 + d * (float) k;
-                x[k] = x[k] * (1.0f - g) + (s != nullptr ? s[k] * g : 0.0f);
-            }
-        }
-    }
 
     // 5) Clipping prevention: -1.0 dBFS, one gain for all 12 positions, no look-ahead (0 ms)
     const bool limOn = limiterParam->load (std::memory_order_relaxed) > 0.5f;
@@ -699,6 +627,17 @@ void AtmosBridgeProcessor::processChunk (const float* const* src, int numSrc, in
         limGainDb.store (0.0f, std::memory_order_relaxed);
     }
     limiterWasOn = limOn;
+
+    // BYPASS crossfade on the Atmos side
+    if (atmosGain0 < 1.0f || atmosGain1 < 1.0f)
+    {
+        const float d = (atmosGain1 - atmosGain0) / (float) n;
+        for (int p = 0; p < kNumChannels; ++p)
+        {
+            float* x = posPtrs[(size_t) p];
+            for (int k = 0; k < n; ++k) x[k] *= atmosGain0 + d * (float) k;
+        }
+    }
 
     // 6) Meters (~80 ms RMS)
     const float a = (float) std::exp (-(double) n / (0.08 * sr));
@@ -822,7 +761,6 @@ void AtmosBridgeProcessor::setAllMuted (bool shouldMute)
 
 void AtmosBridgeProcessor::toggleInputNoise (int input)
 {
-    if (getOutputFormat() == OutputFormat::Stereo && input > 1) return;   // 2ch: only inputs 1-2
     sequenceOn.store (false);
     positionNoise.store (-1);
     inputNoise.store (inputNoise.load() == input ? -1 : input);
@@ -830,7 +768,6 @@ void AtmosBridgeProcessor::toggleInputNoise (int input)
 
 void AtmosBridgeProcessor::togglePositionNoise (int position)
 {
-    if (getOutputFormat() == OutputFormat::Stereo && position > 1) return;   // 2ch: only L/R
     sequenceOn.store (false);
     inputNoise.store (-1);
     positionNoise.store (positionNoise.load() == position ? -1 : position);
@@ -936,179 +873,7 @@ AtmosBridgeProcessor::SlotView AtmosBridgeProcessor::getSlot (int index) const
     v.bypass = e.bypass;
     v.active = index == activeSlot;
     v.latencyMs = info.loaded ? 1000.0 * info.latencySamples / juce::jmax (1.0, currentSampleRate) : 0.0;
-   #if AB_TEST_HOOKS
-    if (testSlotName[(size_t) index].isNotEmpty())
-    {
-        v.name = testSlotName[(size_t) index];
-        v.latencyMs = testSlotLatency[(size_t) index];
-        v.layout = juce::String::fromUTF8 ("Stereo \xe2\x86\x92 7.1.4 Surround (12ch)");
-    }
-   #endif
     return v;
-}
-
-void AtmosBridgeProcessor::setOutputFormat (ab::OutputFormat f)
-{
-    if ((int) f == outputFormat.load()) return;
-    outputFormat.store ((int) f);
-    ++formatVersion;
-    if (f == OutputFormat::Stereo && (positionNoise.load() > 1 || inputNoise.load() > 1)) stopTests();
-    if (auto* s = getSharedOutput()) s->engine.setStereo (f == OutputFormat::Stereo);
-    writeExtrasToState();
-    updateLatency();
-    bumpSlots();
-    logLine (std::string ("Output format: ") + (f == ab::OutputFormat::Stereo ? "2ch Stereo" : "Atmos"));
-}
-
-//============================================================================== 2ch plugins
-int AtmosBridgeProcessor::getNumFx() const noexcept
-{
-   #if AB_TEST_HOOKS
-    if (! testFxOverride.empty()) return (int) testFxOverride.size();
-   #endif
-    return (int) fxSlots.size();
-}
-
-AtmosBridgeProcessor::FxView AtmosBridgeProcessor::getFx (int index) const
-{
-   #if AB_TEST_HOOKS
-    if (! testFxOverride.empty())
-        return index >= 0 && index < (int) testFxOverride.size() ? testFxOverride[(size_t) index] : FxView();
-   #endif
-    FxView v;
-    if (index < 0 || index >= (int) fxSlots.size()) return v;
-    const auto& e = fxSlots[(size_t) index];
-    const auto& info = fxHosts[(size_t) e.host]->getInfo();
-    v.loaded = info.loaded;
-    v.name = info.loaded ? info.name : (e.name.isNotEmpty() ? e.name : juce::File (e.path).getFileNameWithoutExtension());
-    v.path = e.path;
-    v.layout = info.layout;
-    v.error = info.loaded ? juce::String() : (e.error.isNotEmpty() ? e.error : info.error);
-    v.bypass = e.bypass;
-    v.latencyMs = info.loaded ? 1000.0 * info.latencySamples / juce::jmax (1.0, currentSampleRate) : 0.0;
-    return v;
-}
-
-int AtmosBridgeProcessor::findFreeFxHost() const noexcept
-{
-    for (int h = 0; h < kMaxFx; ++h)
-    {
-        bool used = false;
-        for (const auto& e : fxSlots) used = used || e.host == h;
-        if (! used) return h;
-    }
-    return -1;
-}
-
-int AtmosBridgeProcessor::getFxHostIndex (int index) const noexcept
-{
-    return (index >= 0 && index < (int) fxSlots.size()) ? fxSlots[(size_t) index].host : -1;
-}
-
-juce::AudioPluginInstance* AtmosBridgeProcessor::getFxInstance (int index) const noexcept
-{
-    const int h = getFxHostIndex (index);
-    return h >= 0 ? fxHosts[(size_t) h]->getInstance() : nullptr;
-}
-
-void AtmosBridgeProcessor::rebuildFxChain()
-{
-    std::array<int, kMaxFx> chain;
-    chain.fill (-1);
-    int k = 0;
-    for (const auto& e : fxSlots)
-        if (! e.bypass && fxHosts[(size_t) e.host]->getInfo().loaded && k < kMaxFx)
-            chain[(size_t) k++] = e.host;
-    {
-        // Swap the whole chain between two chunks (a reorder must never run one plugin twice in a chunk).
-        const juce::SpinLock::ScopedLockType sl (procLock);
-        for (int i = 0; i < kMaxFx; ++i) fxChain[(size_t) i].store (chain[(size_t) i], std::memory_order_release);
-    }
-    ++fxVersion;
-    updateLatency();
-}
-
-bool AtmosBridgeProcessor::addFx (const juce::String& path, juce::String& error)
-{
-    error.clear();
-    if ((int) fxSlots.size() >= kMaxFx)
-    {
-        error = juce::String::fromUTF8 ("2ch 플러그인은 최대 3개까지 추가할 수 있습니다");
-        return false;
-    }
-    const int h = findFreeFxHost();
-    if (h < 0) return false;
-
-    auto& host = *fxHosts[(size_t) h];
-    if (! host.load (path))
-    {
-        error = host.getInfo().error;
-        return false;
-    }
-    host.resetPlugin();
-    host.setEnabled (true);
-
-    FxEntry e;
-    e.host = h;
-    e.path = path;
-    e.name = host.getInfo().name;
-    fxSlots.push_back (e);
-    rebuildFxChain();
-    writeExtrasToState();
-    logLine ("2ch plugin added: " + e.name.toStdString());
-    return true;
-}
-
-void AtmosBridgeProcessor::removeFx (int index)
-{
-    if (index < 0 || index >= (int) fxSlots.size()) return;
-    const auto e = fxSlots[(size_t) index];
-    fxSlots.erase (fxSlots.begin() + index);
-    rebuildFxChain();                       // the audio thread stops using the host first
-    fxHosts[(size_t) e.host]->unload();     // waits for a running processStereo() call
-    ++fxVersion;
-    writeExtrasToState();
-    logLine ("2ch plugin removed: " + e.name.toStdString());
-}
-
-void AtmosBridgeProcessor::moveFxUp (int index)
-{
-    if (index <= 0 || index >= (int) fxSlots.size()) return;
-    std::swap (fxSlots[(size_t) index - 1], fxSlots[(size_t) index]);
-    rebuildFxChain();
-    writeExtrasToState();
-    logLine ("2ch plugin moved up: " + fxSlots[(size_t) index - 1].name.toStdString());
-}
-
-void AtmosBridgeProcessor::toggleFxBypass (int index)
-{
-    if (index < 0 || index >= (int) fxSlots.size()) return;
-    auto& e = fxSlots[(size_t) index];
-    e.bypass = ! e.bypass;
-    if (! e.bypass) fxHosts[(size_t) e.host]->resetPlugin();   // no stale tail when it comes back
-    rebuildFxChain();
-    writeExtrasToState();
-    logLine ("2ch plugin " + e.name.toStdString() + (e.bypass ? ": bypass" : ": bypass off"));
-}
-
-void AtmosBridgeProcessor::unloadAllFx()
-{
-    for (auto& c : fxChain) c.store (-1, std::memory_order_release);
-    for (const auto& e : fxSlots) fxHosts[(size_t) e.host]->unload();
-    fxSlots.clear();
-    ++fxVersion;
-}
-
-double AtmosBridgeProcessor::getPluginLatencyMs() const noexcept
-{
-    double ms = getOutputFormat() == OutputFormat::Stereo ? 0.0 : getUpmixerLatencyMs();
-    for (int k = 0; k < kMaxFx; ++k)
-    {
-        const int h = fxChain[(size_t) k].load();
-        if (h < 0) break;
-        ms += 1000.0 * fxHosts[(size_t) h]->getInfo().latencySamples / juce::jmax (1.0, currentSampleRate);
-    }
-    return ms;
 }
 
 bool AtmosBridgeProcessor::addUpmixer (const juce::String& path, juce::String& error)
@@ -1219,7 +984,8 @@ double AtmosBridgeProcessor::getUpmixerLatencyMs() const noexcept
 
 void AtmosBridgeProcessor::updateLatency()
 {
-    setLatencySamples (juce::roundToInt (getPluginLatencyMs() * 0.001 * currentSampleRate));
+    const int h = activeHost.load();
+    setLatencySamples ((h >= 0 && hosts[(size_t) h]->isActive()) ? hosts[(size_t) h]->getInfo().latencySamples : 0);
 }
 
 void AtmosBridgeProcessor::handleAsyncUpdate()
@@ -1251,30 +1017,6 @@ void AtmosBridgeProcessor::handleAsyncUpdate()
         host.setEnabled (! e.bypass);
         slots.push_back (e);
     }
-    unloadAllFx();
-    for (auto& r : p.fx)
-    {
-        if ((int) fxSlots.size() >= kMaxFx) break;
-        FxEntry e = r;
-        e.host = findFreeFxHost();
-        auto& host = *fxHosts[(size_t) e.host];
-        if (host.load (e.path))
-        {
-            host.setStateBase64 (r.pendingState);
-            e.pendingState.clear();
-            e.name = host.getInfo().name;
-            e.error.clear();
-        }
-        else
-        {
-            e.error = host.getInfo().error;
-            logLine ("2ch plugin could not be restored: " + e.path.toStdString());
-        }
-        host.setEnabled (true);
-        fxSlots.push_back (e);
-    }
-    rebuildFxChain();
-
     directMap = p.direct;
     activeSlot = -1;
     const Map restoredLive = liveMap();
@@ -1303,8 +1045,7 @@ void AtmosBridgeProcessor::writeExtrasToState()
     s.setProperty ("uiScale", uiScale, nullptr);
     s.setProperty ("theme", (int) theme, nullptr);
     s.setProperty ("directSource", directSourceId, nullptr);
-    s.setProperty ("outputFormat", outputFormat.load(), nullptr);
-    s.setProperty ("stateVersion", 4, nullptr);
+    s.setProperty ("stateVersion", 3, nullptr);
 
     // While a restore is still pending, the slots that are about to be loaded are what we save.
     const bool pending = pendingRestore.valid;
@@ -1326,20 +1067,6 @@ void AtmosBridgeProcessor::writeExtrasToState()
     }
     if (auto old = s.getChildWithName ("UPMIXERS"); old.isValid()) s.removeChild (old, nullptr);
     s.appendChild (ups, nullptr);
-
-    // 2ch plugins (v1.5)
-    const auto& fxList = pending ? pendingRestore.fx : fxSlots;
-    juce::ValueTree fx ("FX");
-    for (const auto& e : fxList)
-    {
-        juce::ValueTree t ("PLUGIN");
-        t.setProperty ("path", e.path, nullptr);
-        t.setProperty ("name", e.name, nullptr);
-        t.setProperty ("bypass", e.bypass, nullptr);
-        fx.appendChild (t, nullptr);
-    }
-    if (auto old = s.getChildWithName ("FX"); old.isValid()) s.removeChild (old, nullptr);
-    s.appendChild (fx, nullptr);
 }
 
 void AtmosBridgeProcessor::readExtrasFromState()
@@ -1389,23 +1116,7 @@ void AtmosBridgeProcessor::readExtrasFromState()
         p.slots.push_back (e);
         p.active = 0;
     }
-    if (version >= 4)
-    {
-        const auto fx = s.getChildWithName ("FX");
-        for (int i = 0; i < fx.getNumChildren() && i < kMaxFx; ++i)
-        {
-            const auto t = fx.getChild (i);
-            FxEntry e;
-            e.path = t.getProperty ("path", "").toString();
-            e.name = t.getProperty ("name", "").toString();
-            e.pendingState = t.getProperty ("state", "").toString();
-            e.bypass = (bool) t.getProperty ("bypass", false);
-            if (e.path.isNotEmpty()) p.fx.push_back (e);
-        }
-    }
-    const int wantFormat = juce::jlimit (0, 1, (int) s.getProperty ("outputFormat", 0));
     pendingRestore = std::move (p);
-    setOutputFormat ((OutputFormat) wantFormat);
     triggerAsyncUpdate(); // plugins must be loaded on the message thread
 
     const juce::String dev = s.getProperty ("outputDevice", "").toString();
@@ -1436,21 +1147,6 @@ void AtmosBridgeProcessor::getStateInformation (juce::MemoryBlock& destData)
             st = hosts[(size_t) e.host]->getInfo().loaded ? hosts[(size_t) e.host]->getStateBase64() : e.pendingState;
         }
         ups.getChild (i).setProperty ("state", st, nullptr);
-    }
-    auto fx = state.getChildWithName ("FX");
-    for (int i = 0; i < fx.getNumChildren(); ++i)
-    {
-        juce::String st;
-        if (pending)
-        {
-            if (i < (int) pendingRestore.fx.size()) st = pendingRestore.fx[(size_t) i].pendingState;
-        }
-        else if (i < (int) fxSlots.size())
-        {
-            const auto& e = fxSlots[(size_t) i];
-            st = fxHosts[(size_t) e.host]->getInfo().loaded ? fxHosts[(size_t) e.host]->getStateBase64() : e.pendingState;
-        }
-        fx.getChild (i).setProperty ("state", st, nullptr);
     }
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
