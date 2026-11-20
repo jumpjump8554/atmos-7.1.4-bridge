@@ -1522,15 +1522,20 @@ public:
         bypassBtn.getProperties().set ("radius", 16.0);
         bypassBtn.getProperties().set ("bold", true);
         bypassBtn.setButtonText ("BYPASS");
-        bypassBtn.setTooltip (tr ("Atmos Bridge 전체 바이패스: 원본 신호를 호스트 출력으로 그대로 보내고 Atmos 출력은 멈춥니다 "
-                                  "(호스트의 바이패스 버튼과 같은 기능)"));
+        bypassBtn.setTooltip (tr ("Atmos Bridge 전체 바이패스: 2ch 플러그인 \xc2\xb7 업믹서 \xc2\xb7 채널 매핑을 거치지 않은 원본 신호를 "
+                                  "Atmos Bridge 출력으로 그대로 보냅니다 (호스트의 바이패스 버튼과 같은 기능)"));
         bypassBtn.onClick = [this] { proc.setBypassed (! proc.isBypassed()); };
         addAndMakeVisible (bypassBtn);
 
         for (int i = 0; i < kMaxFx; ++i)
         {
             fxRows[(size_t) i] = std::make_unique<SlotRow> (ctx, true);
-            addChildComponent (*fxRows[(size_t) i]);
+            auto& r = *fxRows[(size_t) i];
+            r.onBtn.onClick  = [this, i] { proc.moveFxUp (i); lastError.clear(); };
+            r.bypBtn.onClick = [this, i] { proc.toggleFxBypass (i); lastError.clear(); };
+            r.delBtn.onClick = [this, i] { proc.removeFx (i); lastError.clear(); };
+            r.onOpen = [this, i] { if (onOpenFx) onOpenFx (i); };
+            addChildComponent (r);
         }
         for (int i = 0; i < kMaxUpmixers; ++i)
         {
@@ -1545,13 +1550,14 @@ public:
 
         fxAdd.setTooltip (tr ("설치된 2ch(Stereo \xe2\x86\x92 Stereo) VST3 플러그인을 추가합니다. "
                               "Atmos에서는 업믹서 앞, 2ch Stereo에서는 출력 앞에서 순서대로 적용됩니다."));
+        fxAdd.onClick = [this] { showAddMenu (true); };
         addAndMakeVisible (fxAdd);
-        upAdd.onClick = [this] { showAddMenu(); };
+        upAdd.onClick = [this] { showAddMenu (false); };
         upAdd.setTooltip (tr ("설치된 VST3 업믹서(예: zAuro Pro 2D-3D, zSonic)를 추가합니다"));
         addAndMakeVisible (upAdd);
     }
 
-    std::function<void (int)> onOpenSlot;
+    std::function<void (int)> onOpenSlot, onOpenFx;
 
     void resized() override
     {
@@ -1690,8 +1696,9 @@ private:
         afterUpY = y;
     }
 
-    void showAddMenu()
+    void showAddMenu (bool fx)
     {
+        addingFx = fx;
         lastError.clear();
         repaint();
         installed = UpmixerHost::findInstalledVst3();
@@ -1705,7 +1712,8 @@ private:
         m.addItem (1000, tr ("다른 위치에서 찾기\xe2\x80\xa6"));
 
         juce::Component::SafePointer<RightPanel> safe (this);
-        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&upAdd), [safe] (int r)
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (fx ? (juce::Component*) &fxAdd : (juce::Component*) &upAdd),
+                         [safe] (int r)
         {
             if (safe == nullptr || r <= 0) return;
             if (r == 1000) { safe->browse(); return; }
@@ -1715,7 +1723,7 @@ private:
 
     void browse()
     {
-        chooser = std::make_unique<juce::FileChooser> (tr ("업믹서 VST3 선택"),
+        chooser = std::make_unique<juce::FileChooser> (addingFx ? tr ("2ch 플러그인 VST3 선택") : tr ("업믹서 VST3 선택"),
                                                        juce::File ("C:\\Program Files\\Common Files\\VST3"), "*.vst3");
         juce::Component::SafePointer<RightPanel> safe (this);
         chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles
@@ -1732,12 +1740,14 @@ private:
     {
         juce::MouseCursor::showWaitCursor();
         juce::String err;
-        const bool ok = proc.addUpmixer (f.getFullPathName(), err);
+        const bool fx = addingFx;
+        const bool ok = fx ? proc.addFx (f.getFullPathName(), err) : proc.addUpmixer (f.getFullPathName(), err);
         juce::MouseCursor::hideWaitCursor();
         lastError = ok ? juce::String() : err;
         refresh();
         repaint();
-        if (ok && onOpenSlot) onOpenSlot (proc.getNumSlots() - 1);
+        if (ok && fx && onOpenFx) onOpenFx (proc.getNumFx() - 1);
+        if (ok && ! fx && onOpenSlot) onOpenSlot (proc.getNumSlots() - 1);
     }
 
     AtmosBridgeProcessor& proc;
@@ -1749,7 +1759,7 @@ private:
     juce::Array<juce::File> installed;
     std::unique_ptr<juce::FileChooser> chooser;
     juce::String lastError;
-    bool shownLimiter = false, shownBypass = false, themeDirty = true, stereo = false;
+    bool shownLimiter = false, shownBypass = false, themeDirty = true, stereo = false, addingFx = false;
     int shownVersion = -1, shownCount = -1, shownFx = -1, slowTick = 0;
     int fxHeadY = kSecY0, dividerY = 300, upHeadY = 310, afterUpY = 400;
 };
@@ -1958,8 +1968,11 @@ public:
         addAndMakeVisible (right);
 
         right.onOpenSlot = [this] (int i) { openSlotWindow (i); };
+        right.onOpenFx = [this] (int i) { openFxWindow (i); };
         for (int h = 0; h < kMaxUpmixers; ++h)
             proc.getHost (h).beforeUnload = [this, h] { windows[(size_t) h].reset(); };
+        for (int h = 0; h < kMaxFx; ++h)
+            proc.getFxHost (h).beforeUnload = [this, h] { fxWindows[(size_t) h].reset(); };
 
         static const char* modeNames[kNumModes] = { "기본", "저지연", "초저지연+" };
         static const char* modeTips[kNumModes] = {
@@ -2044,7 +2057,25 @@ public:
     ~RootView() override
     {
         for (int h = 0; h < kMaxUpmixers; ++h) proc.getHost (h).beforeUnload = nullptr;
+        for (int h = 0; h < kMaxFx; ++h) proc.getFxHost (h).beforeUnload = nullptr;
         for (auto& w : windows) w.reset();
+        for (auto& w : fxWindows) w.reset();
+    }
+
+    void openFxWindow (int index)
+    {
+        const int h = proc.getFxHostIndex (index);
+        if (h < 0) return;
+        auto& w = fxWindows[(size_t) h];
+        if (w != nullptr) { w->toFront (true); return; }
+        if (auto* inst = proc.getFxInstance (index))
+        {
+            juce::Component::SafePointer<RootView> safe (this);
+            w = std::make_unique<HostedPluginWindow> (*inst, ctx.th().bgTop, [safe, h]
+            {
+                juce::MessageManager::callAsync ([safe, h] { if (safe != nullptr) safe->fxWindows[(size_t) h].reset(); });
+            });
+        }
     }
 
     void openSlotWindow (int slot)
@@ -2239,7 +2270,7 @@ private:
         deviceIds.clear();
         device.clear (juce::dontSendNotification);
         deviceIds.add ({});
-        device.addItem (tr ("자동 (공간 음향 켜진 AVR/HDMI, 가상 케이블 제외)"), 1);
+        device.addItem (tr ("자동 (AVR/HDMI 우선, 가상 케이블 제외)"), 1);
         const auto list = SpatialEngine::listOutputDevices();
         int id = 2;
         for (const auto& d : list)
@@ -2310,9 +2341,16 @@ private:
                     else
                     {
                         statusColour = t.ok;
-                        statusText = (proc.getOutputFormat() == OutputFormat::Stereo ? tr ("2ch 출력 중 \xc2\xb7 ")
-                                                                                       : tr ("출력 중 \xc2\xb7 ")) + name;
+                        statusText = (s->engine.isStereoActive() ? tr ("2ch 출력 중 \xc2\xb7 ") : tr ("출력 중 \xc2\xb7 ")) + name;
                     }
+                    break;
+                case EngineStatus::Busy:
+                    statusColour = t.red;
+                    statusText = tr ("2ch: AVR을 다른 앱이 사용 중 (호스트 출력 확인)");
+                    break;
+                case EngineStatus::ExclusiveOff:
+                    statusColour = t.amber;
+                    statusText = tr ("2ch: 배타 모드 꺼짐 (소리 설정에서 허용)");
                     break;
                 case EngineStatus::Connecting:
                     statusColour = t.amber;
@@ -2350,10 +2388,16 @@ private:
             const bool running = st == EngineStatus::Running;
             const int mode = (int) proc.getMode();
             const double margin = s->feeder.getMarginMs();
-            // Plugin latency: the 2ch plugins (not bypassed) + the upmixer (Atmos only)
-            double upLat = proc.getOutputFormat() == OutputFormat::Stereo ? 0.0 : proc.getUpmixerLatencyMs();
-            for (int i = 0; i < proc.getNumFx(); ++i)
-                if (const auto fx = proc.getFx (i); fx.loaded && ! fx.bypass) upLat += fx.latencyMs;
+            // Plugin latency: the 2ch plugins that are on + the upmixer (Atmos only)
+            double upLat = proc.getPluginLatencyMs();
+           #if AB_TEST_HOOKS
+            if (! proc.testFxOverride.empty())   // UI previews: display values
+            {
+                upLat = proc.getOutputFormat() == OutputFormat::Stereo ? 0.0 : proc.getUpmixerLatencyMs();
+                for (int i = 0; i < proc.getNumFx(); ++i)
+                    if (const auto fx = proc.getFx (i); fx.loaded && ! fx.bypass) upLat += fx.latencyMs;
+            }
+           #endif
             const auto ds = proc.getDirectStatus();
             const bool direct = mode != (int) LatencyMode::Music
                                 && (ds.state == AtmosBridgeProcessor::DirectStatus::Settling || ds.state == AtmosBridgeProcessor::DirectStatus::Running);
@@ -2489,6 +2533,7 @@ private:
     int lastMode = -1;
 
     std::array<std::unique_ptr<HostedPluginWindow>, kMaxUpmixers> windows;
+    std::array<std::unique_ptr<HostedPluginWindow>, kMaxFx> fxWindows;
 
     juce::Colour statusColour { juce::Colours::grey }, clockColour { juce::Colours::grey };
     juce::String statusText, rateText { tr ("48 kHz") }, modeText, testText, clockText;

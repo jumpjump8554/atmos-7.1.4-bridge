@@ -153,21 +153,36 @@ public:
     double getUpmixerLatencyMs() const noexcept;    // latency of the upmixer that is running now
     int getSlotsVersion() const noexcept { return slotsVersion; } // changes whenever the slot list changes
 
-    //========================================================================== output format + 2ch plugins (v1.5)
-    ab::OutputFormat getOutputFormat() const noexcept { return (ab::OutputFormat) outputFormat.load(); }
+    //========================================================================== output format (v1.5)
+    // Atmos: 12 positions through Windows spatial audio. 2ch Stereo: host channels 1-2 (after the 2ch plugins)
+    // -> L/R only, sent as PCM 2.0 in WASAPI exclusive mode; the upmixers are not used.
+    ab::OutputFormat getOutputFormat() const noexcept { return (ab::OutputFormat) outputFormat.load (std::memory_order_relaxed); }
     void setOutputFormat (ab::OutputFormat f);
     int getFormatVersion() const noexcept { return formatVersion.load(); }
+
+    //========================================================================== 2ch plugins (message thread)
+    // Up to 3 stereo VST3 plugins (e.g. XTC, EQ), all applied in list order to host channels 1-2:
+    // before the upmixer (Atmos) or before the 2ch output. B = bypass (skipped).
     struct FxView
     {
-        juce::String name, layout, error;
+        juce::String name, path, layout, error;
         bool loaded = false, bypass = false;
         double latencyMs = 0.0;
     };
-    int getNumFx() const noexcept { return (int) fxViews.size(); }
-    FxView getFx (int index) const { return index >= 0 && index < (int) fxViews.size() ? fxViews[(size_t) index] : FxView(); }
+    int getNumFx() const noexcept;
+    FxView getFx (int index) const;
     int getFxVersion() const noexcept { return fxVersion; }
+    bool addFx (const juce::String& path, juce::String& error);   // appended at the end, on
+    void removeFx (int index);
+    void moveFxUp (int index);
+    void toggleFxBypass (int index);
+    int getFxHostIndex (int index) const noexcept;
+    UpmixerHost& getFxHost (int hostIndex) noexcept { return *fxHosts[(size_t) hostIndex]; }
+    juce::AudioPluginInstance* getFxInstance (int index) const noexcept;
+    double getPluginLatencyMs() const noexcept;   // 2ch plugins that are on + the upmixer (Atmos only)
    #if AB_TEST_HOOKS
-    void testSetFx (std::vector<FxView> v) { fxViews = std::move (v); ++fxVersion; }
+    std::vector<FxView> testFxOverride;           // display only (UI previews)
+    void testSetFx (std::vector<FxView> v) { testFxOverride = std::move (v); ++fxVersion; }
     std::array<juce::String, ab::kMaxUpmixers> testSlotName;   // display overrides (UI previews)
     std::array<double, ab::kMaxUpmixers> testSlotLatency {};
    #endif
@@ -187,12 +202,12 @@ private:
     void updateChannelTable();
     void writeExtrasToState();
     void readExtrasFromState();
-    void processChunk (const float* const* src, int numSrc, int num, float atmosGain0, float atmosGain1);
+    // raw0/raw1: share of the original input (BYPASS ramp) at the start/end of the chunk
+    void processChunk (const float* const* src, int numSrc, int num, float raw0, float raw1);
     void processSource (const float* const* src, int numSrc, int num); // BYPASS ramp + processChunk / silence
     void pushSilence (int num);
 
     std::atomic<int> outputFormat { 0 }, formatVersion { 0 };
-    std::vector<FxView> fxViews;
     int fxVersion = 0;
 
     // Direct loopback input (Low latency / Ultra low latency+)
@@ -223,8 +238,7 @@ private:
     std::atomic<float>* modeParam = nullptr;
     std::atomic<float>* limiterParam = nullptr;
     std::atomic<float>* bypassParam = nullptr;
-    float atmosMix = 0.0f;    // processing thread: BYPASS ramp of the Atmos side (0 = active, 1 = bypassed)
-    float hostMix = 0.0f;     // host audio thread: BYPASS ramp of the host pass-through
+    float atmosMix = 0.0f;    // processing thread: BYPASS ramp (0 = processed, 1 = original input)
 
     std::array<std::atomic<int>, ab::kNumChannels> outMap;
     std::array<std::atomic<int>, ab::kMaxInputs> hostToJuce;   // host channel index -> JUCE buffer index
@@ -265,7 +279,29 @@ private:
     std::atomic<int> activeHost { -1 };
     int slotsVersion = 0;
 
-    struct PendingRestore { bool valid = false; std::vector<SlotEntry> slots; int active = -1; Map direct = defaultMap(); };
+    // 2ch plugins: hosts never move; fxChain (audio thread) lists the hosts that are on, in order, -1 = end.
+    struct FxEntry
+    {
+        int host = -1;
+        juce::String path, name, pendingState, error;
+        bool bypass = false;
+    };
+    std::array<std::unique_ptr<UpmixerHost>, ab::kMaxFx> fxHosts;
+    std::vector<FxEntry> fxSlots;
+    std::array<std::atomic<int>, ab::kMaxFx> fxChain;
+    juce::AudioBuffer<float> fxWork;
+    void rebuildFxChain();
+    int findFreeFxHost() const noexcept;
+    void unloadAllFx();
+
+    struct PendingRestore
+    {
+        bool valid = false;
+        std::vector<SlotEntry> slots;
+        int active = -1;
+        Map direct = defaultMap();
+        std::vector<FxEntry> fx;
+    };
     PendingRestore pendingRestore;   // restored state, applied on the message thread
 
     ab::ThemeId theme = ab::ThemeId::Cyberpunk;
