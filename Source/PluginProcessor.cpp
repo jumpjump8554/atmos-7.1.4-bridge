@@ -1013,11 +1013,17 @@ juce::AudioPluginInstance* AtmosBridgeProcessor::getFxInstance (int index) const
 
 void AtmosBridgeProcessor::rebuildFxChain()
 {
+    std::array<int, kMaxFx> chain;
+    chain.fill (-1);
     int k = 0;
     for (const auto& e : fxSlots)
         if (! e.bypass && fxHosts[(size_t) e.host]->getInfo().loaded && k < kMaxFx)
-            fxChain[(size_t) k++].store (e.host, std::memory_order_release);
-    for (; k < kMaxFx; ++k) fxChain[(size_t) k].store (-1, std::memory_order_release);
+            chain[(size_t) k++] = e.host;
+    {
+        // Swap the whole chain between two chunks (a reorder must never run one plugin twice in a chunk).
+        const juce::SpinLock::ScopedLockType sl (procLock);
+        for (int i = 0; i < kMaxFx; ++i) fxChain[(size_t) i].store (chain[(size_t) i], std::memory_order_release);
+    }
     ++fxVersion;
     updateLatency();
 }
