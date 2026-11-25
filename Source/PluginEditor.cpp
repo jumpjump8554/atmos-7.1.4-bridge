@@ -2403,7 +2403,17 @@ const juce::Rectangle<float> kHRate   { 506.0f, 117.0f, 112.0f, 32.0f };
 const juce::Rectangle<float> kHDrop   { 1100.0f, 816.0f, 70.0f, 36.0f };
 constexpr int kHostW = 1740, kHostH = 884;
 
-struct FxPreview { juce::String name, layout; double latencyMs; bool bypass; int scope; };   // scope: 0 both, 1 2ch only, 2 Atmos only
+// One plugin of the host chain. Stereo plugins (2 -> 2) and upmixers (2 -> 12) share one list, in any order:
+// before the upmixer the chain carries 2 channels, after it 12 (a stereo plugin there works on CH 1-2 = L/R).
+struct ChainItem
+{
+    juce::String name;
+    bool upmixer = false;
+    double latencyMs = 0.0;
+    bool bypass = false;
+    int scope = 0;          // stereo plugins: 0 both formats, 1 2ch only, 2 Atmos only (upmixers: Atmos only)
+    bool active = true;     // upmixers: only one is on
+};
 
 const char* scopeText (int s) { return s == 1 ? "2ch \xeb\xa7\x8c" : s == 2 ? "Atmos \xeb\xa7\x8c" : "2ch \xc2\xb7 Atmos"; }
 
@@ -2418,53 +2428,62 @@ void groupFrame (juce::Graphics& g, const Theme& t, juce::Rectangle<float> r)
 } // namespace
 
 //==============================================================================
-// One plugin of the 2ch chain: drag handle, number, name (click = settings), scope chip, B (bypass), D (delete).
-class FxRow final : public juce::Component, public juce::SettableTooltipClient
+// One row of the chain: drag handle, number, name (click = settings), format chip, [O/X for upmixers], B, D.
+class ChainRow final : public juce::Component, public juce::SettableTooltipClient
 {
 public:
-    explicit FxRow (const UiCtx& c) : ctx (c)
+    explicit ChainRow (const UiCtx& c) : ctx (c)
     {
-        for (auto* b : { &scopeBtn, &bypBtn, &delBtn })
+        for (auto* b : { &scopeBtn, &onBtn, &bypBtn, &delBtn })
         {
             b->getProperties().set ("radius", 6.0);
             addAndMakeVisible (*b);
         }
-        bypBtn.getProperties().set ("mono", true);
-        delBtn.getProperties().set ("mono", true);
+        for (auto* b : { &onBtn, &bypBtn, &delBtn }) b->getProperties().set ("mono", true);
         bypBtn.setButtonText ("B");
         delBtn.setButtonText ("D");
-        scopeBtn.setTooltip (tr ("어느 출력 형식에서 쓸지: 2ch \xc2\xb7 Atmos / 2ch만 / Atmos만 (누를 때마다 바뀜). "
-                                 "XTC(zBACCH 등)는 2ch만으로 두면 Atmos에서는 자동으로 쉽니다."));
+        onBtn.setTooltip (tr ("O = 켜짐 / X = 꺼짐 (켜진 업믹서는 하나뿐)"));
         bypBtn.setTooltip (tr ("바이패스: 이 플러그인만 건너뜀 (지연에서도 빠짐)"));
         delBtn.setTooltip (tr ("체인에서 삭제"));
         setTooltip (tr ("이름을 누르면 설정 창 \xc2\xb7 \xe2\x89\xa1 끌어서 순서 변경"));
     }
 
-    void setData (const FxPreview& d, int index, bool stereo)
+    void setData (const ChainItem& d, int index, bool stereo, bool afterUpmixer)
     {
         data = d;
         idx = index;
-        idle = (stereo && d.scope == 2) || (! stereo && d.scope == 1);
+        after = afterUpmixer;
+        idle = d.upmixer ? (stereo || ! d.active) : (stereo && d.scope == 2) || (! stereo && d.scope == 1);
         const auto& t = ctx.th();
-        scopeBtn.setButtonText (tr (scopeText (d.scope)));
+        const bool special = d.upmixer || d.scope != 0;
+        scopeBtn.setButtonText (d.upmixer ? tr ("Atmos \xeb\xa7\x8c") : tr (scopeText (d.scope)));
+        scopeBtn.setEnabled (! d.upmixer);
+        scopeBtn.setTooltip (d.upmixer ? tr ("업믹서는 Atmos 7.1.4에서만 씁니다 (2ch Stereo에서는 AVR이 업믹스)")
+                                       : tr ("어느 출력 형식에서 쓸지: 2ch \xc2\xb7 Atmos / 2ch만 / Atmos만 (누를 때마다 바뀜). "
+                                             "XTC(zBACCH 등)는 2ch만으로 두면 Atmos에서는 자동으로 쉽니다."));
         scopeBtn.setColour (juce::TextButton::buttonColourId, t.btn);
-        scopeBtn.setColour (juce::TextButton::textColourOffId, d.scope == 0 ? t.dim : (t.dark ? t.accent : t.text));
-        setBorder (scopeBtn, d.scope == 0 ? t.btnBorder : (t.dark ? t.accent.withAlpha (0.7f) : t.dim));
+        scopeBtn.setColour (juce::TextButton::textColourOffId, special ? (t.dark ? t.accent : t.text) : t.dim);
+        setBorder (scopeBtn, special ? (t.dark ? t.accent.withAlpha (0.7f) : t.dim) : t.btnBorder);
+        onBtn.setVisible (d.upmixer);
+        onBtn.setButtonText (d.active ? "O" : "X");
+        styleToggle (onBtn, t, d.active);
         bypBtn.setColour (juce::TextButton::buttonColourId, d.bypass ? t.bypBg : t.btn);
         bypBtn.setColour (juce::TextButton::textColourOffId, d.bypass ? t.bypFg : t.dim);
         setBorder (bypBtn, d.bypass ? t.bypBorder : t.btnBorder);
         stylePlain (delBtn, t);
         delBtn.setColour (juce::TextButton::textColourOffId, t.dim);
-        for (auto* b : { &scopeBtn, &bypBtn, &delBtn }) b->repaint();
+        for (auto* b : { &scopeBtn, &onBtn, &bypBtn, &delBtn }) b->repaint();
+        resized();
         repaint();
     }
 
     void resized() override
     {
         const int y = (getHeight() - 28) / 2;
-        scopeBtn.setBounds (getWidth() - 160, y, 86, 28);
-        bypBtn.setBounds (getWidth() - 68, y, 28, 28);
         delBtn.setBounds (getWidth() - 36, y, 28, 28);
+        bypBtn.setBounds (getWidth() - 68, y, 28, 28);
+        onBtn.setBounds (getWidth() - 100, y, 28, 28);
+        scopeBtn.setBounds (getWidth() - (data.upmixer ? 192 : 160), y, 86, 28);
     }
 
     void paint (juce::Graphics& g) override
@@ -2472,50 +2491,55 @@ public:
         const auto& t = ctx.th();
         const auto r = getLocalBounds().toFloat().reduced (0.5f);
         const bool on = ! data.bypass && ! idle;
-        g.setColour (on ? (t.dark ? t.neon.withAlpha (0.06f) : t.panel.interpolatedWith (t.neon, 0.05f)) : t.slotOffBg);
+        const auto edge = data.upmixer ? t.accent : t.neon;
+        g.setColour (on ? (t.dark ? edge.withAlpha (data.upmixer ? 0.08f : 0.06f) : t.panel.interpolatedWith (edge, 0.06f)) : t.slotOffBg);
         g.fillRoundedRectangle (r, 8.0f);
-        g.setColour (on ? (t.dark ? t.neon.withAlpha (0.55f) : t.neon.withAlpha (0.6f)) : t.slotOffBorder);
+        g.setColour (on ? (t.dark ? edge.withAlpha (data.upmixer ? 0.85f : 0.55f) : edge.withAlpha (0.65f)) : t.slotOffBorder);
         g.drawRoundedRectangle (r, 8.0f, 1.0f);
 
         const float a = idle ? 0.5f : 1.0f;
         g.setColour (t.sub.withMultipliedAlpha (a));                       // drag handle
         for (int k = 0; k < 3; ++k) g.fillRoundedRectangle (12.0f, (float) getHeight() * 0.5f - 6.0f + (float) k * 5.0f, 12.0f, 2.0f, 1.0f);
-        g.setColour (t.sub.withMultipliedAlpha (a));
         g.setFont (monoFont (14.0f, true));
         g.drawText (juce::String (idx + 1), 30, 0, 16, getHeight(), juce::Justification::centred);
 
+        const int top = (getHeight() - 38) / 2;
+        const int textW = getWidth() - (data.upmixer ? 252 : 220);
         g.setColour (t.text.withMultipliedAlpha (a));
         g.setFont (uiFont (15.5f, true));
-        g.drawText (data.name, 52, 5, getWidth() - 220, 20, juce::Justification::centredLeft, true);
+        g.drawText (data.name, 52, top, textW, 20, juce::Justification::centredLeft, true);
 
         juce::String info;
         juce::Colour infoCol = t.sub;
-        if (idle)           info = data.scope == 1 ? tr ("2ch 전용 \xc2\xb7 Atmos에서 쉼") : tr ("Atmos 전용 \xc2\xb7 2ch에서 쉼");
-        else if (data.bypass) { info = tr ("바이패스"); infoCol = t.bypFg; }
-        else                info = data.layout + tr (" \xc2\xb7 CH 1-2 \xc2\xb7 ") + juce::String (data.latencyMs, 1) + " ms";
+        const juce::String lat = juce::String (data.latencyMs, 1) + " ms";
+        if (data.bypass)                          { info = tr ("바이패스"); infoCol = t.bypFg; }
+        else if (data.upmixer && ! data.active)   info = tr ("꺼짐 (켜진 업믹서는 하나)");
+        else if (data.upmixer && idle)            info = tr ("Atmos 전용 \xc2\xb7 2ch에서 쉼");
+        else if (idle)                            info = data.scope == 1 ? tr ("2ch 전용 \xc2\xb7 Atmos에서 쉼") : tr ("Atmos 전용 \xc2\xb7 2ch에서 쉼");
+        else if (data.upmixer)                    info = tr ("업믹서 2 \xe2\x86\x92 12ch \xc2\xb7 ") + lat;
+        else                                      info = tr ("Stereo \xc2\xb7 CH 1-2") + (after ? tr (" (L/R)") : juce::String()) + tr (" \xc2\xb7 ") + lat;
         g.setColour (infoCol.withMultipliedAlpha (a));
         g.setFont (uiFont (13.0f));
-        g.drawText (info, 52, 25, getWidth() - 220, 17, juce::Justification::centredLeft, true);
+        g.drawText (info, 52, top + 20, textW, 17, juce::Justification::centredLeft, true);
     }
 
-    juce::TextButton scopeBtn, bypBtn, delBtn;
+    juce::TextButton scopeBtn, onBtn, bypBtn, delBtn;
 
 private:
     const UiCtx& ctx;
-    FxPreview data;
+    ChainItem data;
     int idx = 0;
-    bool idle = false;
+    bool idle = false, after = false;
 };
 
 //==============================================================================
-// Right panel of the host: clipping prevention + BYPASS, 2ch plugin chain, upmixers (Atmos only).
+// Right panel of the host: clipping prevention + BYPASS, then ONE plugin chain (stereo plugins and upmixers, any order).
 class HostRightPanel final : public juce::Component
 {
 public:
-    static constexpr int kFxY0 = 162, kFxH = 46, kFxStep = 52, kMaxFxShown = 3;
-    static constexpr int kUpY0 = 410, kUpH = 56, kUpStep = 64;
+    static constexpr int kY0 = 162, kRowH = 48, kStep = 54, kMaxRows = 7;
 
-    HostRightPanel (AtmosBridgeProcessor& p, const UiCtx& c) : proc (p), ctx (c), fxAdd (c), upAdd (c)
+    HostRightPanel (AtmosBridgeProcessor& p, const UiCtx& c) : proc (p), ctx (c), addBtn (c)
     {
         limBtn.getProperties().set ("radius", 16.0);
         limBtn.getProperties().set ("bold", true);
@@ -2530,44 +2554,50 @@ public:
         bypassBtn.onClick = [this] { proc.setBypassed (! proc.isBypassed()); };
         addAndMakeVisible (bypassBtn);
 
-        for (int i = 0; i < kMaxFxShown; ++i)
+        for (int i = 0; i < kMaxRows; ++i)
         {
-            fxRows[(size_t) i] = std::make_unique<FxRow> (ctx);
-            auto& r = *fxRows[(size_t) i];
-            r.scopeBtn.onClick = [this, i] { if (i < (int) fx.size()) fx[(size_t) i].scope = (fx[(size_t) i].scope + 1) % 3; dirty = true; refresh(); };
-            r.bypBtn.onClick   = [this, i] { if (i < (int) fx.size()) fx[(size_t) i].bypass = ! fx[(size_t) i].bypass; dirty = true; refresh(); };
-            r.delBtn.onClick   = [this, i] { if (i < (int) fx.size()) fx.erase (fx.begin() + i); dirty = true; refresh(); };
+            rows[(size_t) i] = std::make_unique<ChainRow> (ctx);
+            auto& r = *rows[(size_t) i];
+            r.scopeBtn.onClick = [this, i] { if (i < (int) chain.size()) chain[(size_t) i].scope = (chain[(size_t) i].scope + 1) % 3; dirty = true; refresh(); };
+            r.onBtn.onClick = [this, i]
+            {
+                if (i >= (int) chain.size()) return;
+                const bool turnOn = ! chain[(size_t) i].active;
+                for (auto& c : chain) if (c.upmixer) c.active = false;
+                chain[(size_t) i].active = turnOn;
+                dirty = true; refresh();
+            };
+            r.bypBtn.onClick = [this, i] { if (i < (int) chain.size()) chain[(size_t) i].bypass = ! chain[(size_t) i].bypass; dirty = true; refresh(); };
+            r.delBtn.onClick = [this, i] { if (i < (int) chain.size()) chain.erase (chain.begin() + i); dirty = true; refresh(); };
             addChildComponent (r);
         }
-        fxAdd.setButtonText (tr ("+ 플러그인 추가 (스테레오 VST3)"));
-        fxAdd.setTooltip (tr ("RoomSpace \xc2\xb7 Fresh Air \xc2\xb7 zBACCH 같은 스테레오 플러그인. 위에서부터 순서대로 적용"));
-        addAndMakeVisible (fxAdd);
+        addBtn.setButtonText (tr ("+ 플러그인 추가 (스테레오 \xc2\xb7 업믹서)"));
+        addBtn.setTooltip (tr ("설치된 VST3: 스테레오 플러그인(RoomSpace \xc2\xb7 Fresh Air \xc2\xb7 zBACCH 등)과 업믹서를 같은 목록에 추가"));
+        addAndMakeVisible (addBtn);
 
-        for (int i = 0; i < 2; ++i)
+        chain = { { "RoomSpace", false, 1.0, false, 0, true },
+                  { "Fresh Air", false, 0.0, false, 0, true },
+                  { "zBACCH",    false, 10.7, false, 1, true } };
+        for (int i = 0; i < proc.getNumSlots(); ++i)
         {
-            upRows[(size_t) i] = std::make_unique<SlotRow> (ctx);
-            auto& r = *upRows[(size_t) i];
-            r.onBtn.onClick  = [this, i] { proc.toggleSlotActive (i); };
-            r.bypBtn.onClick = [this, i] { proc.toggleSlotBypass (i); };
-            r.delBtn.onClick = [this, i] { proc.removeSlot (i); };
-            addChildComponent (r);
+            const auto sv = proc.getSlot (i);
+            chain.push_back ({ sv.name, true, sv.latencyMs, sv.bypass, 2, sv.active });
         }
-        upAdd.setButtonText (tr ("+ 업믹서 추가 (최대 4개)"));
-        addAndMakeVisible (upAdd);
-
-        fx = { { "RoomSpace", tr ("Stereo"), 1.0, false, 0 },
-               { "Fresh Air", tr ("Stereo"), 0.0, false, 0 },
-               { "zBACCH",    tr ("Stereo"), 10.7, false, 1 } };
     }
 
-    std::vector<FxPreview> fx;
+    std::vector<ChainItem> chain;
 
-    // Latency of the plugins that run in this format (2ch chain + the upmixer in Atmos)
+    // Latency of what runs in this format (the upmixer counts in Atmos only)
     double pluginLatencyMs() const
     {
-        double ms = ctx.stereoOnly ? 0.0 : proc.getUpmixerLatencyMs();
-        for (const auto& f : fx)
-            if (! f.bypass && ! ((ctx.stereoOnly && f.scope == 2) || (! ctx.stereoOnly && f.scope == 1))) ms += f.latencyMs;
+        double ms = 0.0;
+        for (const auto& c : chain)
+        {
+            if (c.bypass) continue;
+            if (c.upmixer) { if (! ctx.stereoOnly && c.active) ms += c.latencyMs; continue; }
+            if ((ctx.stereoOnly && c.scope == 2) || (! ctx.stereoOnly && c.scope == 1)) continue;
+            ms += c.latencyMs;
+        }
         return ms;
     }
 
@@ -2599,33 +2629,29 @@ public:
             bypassBtn.repaint();
             repaint();
         }
-        const int n = proc.getNumSlots();
-        if (dirty || ctx.stereoOnly != shownStereo || proc.getSlotsVersion() != shownVersion || n != shownCount)
+        if (dirty || ctx.stereoOnly != shownStereo)
         {
             shownStereo = ctx.stereoOnly;
-            shownVersion = proc.getSlotsVersion();
-            shownCount = n;
-            for (int i = 0; i < kMaxFxShown; ++i)
+            bool afterUp = false;
+            for (int i = 0; i < kMaxRows; ++i)
             {
-                auto& r = *fxRows[(size_t) i];
-                r.setVisible (i < (int) fx.size());
-                if (i < (int) fx.size()) r.setData (fx[(size_t) i], i, ctx.stereoOnly);
+                auto& r = *rows[(size_t) i];
+                r.setVisible (i < (int) chain.size());
+                if (i < (int) chain.size())
+                {
+                    const auto& c = chain[(size_t) i];
+                    r.setData (c, i, ctx.stereoOnly, afterUp && ! ctx.stereoOnly);
+                    if (c.upmixer && c.active && ! c.bypass) afterUp = true;
+                }
             }
-            for (int i = 0; i < 2; ++i)
-            {
-                auto& r = *upRows[(size_t) i];
-                r.setVisible (i < n);
-                if (i < n) r.setData (proc.getSlot (i));
-                r.setEnabled (! ctx.stereoOnly);
-            }
-            upAdd.setEnabled (! ctx.stereoOnly);
+            addBtn.setEnabled ((int) chain.size() < kMaxRows);
             layoutRows();
             repaint();
         }
         dirty = false;
     }
 
-    void themeChanged() { dirty = true; fxAdd.repaint(); upAdd.repaint(); refresh(); }
+    void themeChanged() { dirty = true; addBtn.repaint(); refresh(); }
 
     void paint (juce::Graphics& g) override
     {
@@ -2646,59 +2672,30 @@ public:
 
         g.setColour (t.divider);
         g.fillRect (18.0f, 118.0f, 404.0f, 1.0f);
-        drawHeading (g, t, tr ("2ch 플러그인"), { 18, 128, 140, 26 });
+        drawHeading (g, t, tr ("플러그인 체인"), { 18, 128, 160, 26 });
         g.setColour (t.sub);
         g.setFont (uiFont (14.0f));
-        g.drawText (tr ("CH 1-2 \xc2\xb7 위에서부터 순서대로 \xc2\xb7 모든 모드에서 적용"), 150, 128, 272, 26, juce::Justification::centredRight, true);
+        g.drawText (tr ("위에서부터 순서대로 \xc2\xb7 \xe2\x89\xa1 끌어서 순서 변경"), 160, 128, 262, 26, juce::Justification::centredRight, true);
 
-        const int upHead = kUpY0 - 38;
-        g.setColour (t.divider);
-        g.fillRect (18.0f, (float) upHead - 10.0f, 404.0f, 1.0f);
-        drawHeading (g, t, tr ("업믹서"), { 18, (float) upHead, 100, 26 });
-        g.setColour (t.sub);
-        g.setFont (uiFont (14.0f));
-        g.drawText (tr ("Atmos 7.1.4 전용 \xc2\xb7 2 \xe2\x86\x92 12ch \xc2\xb7 O/X B D"), 104, upHead, 318, 26, juce::Justification::centredRight, true);
-
-        drawWrapped (g, tr ("이름을 누르면 설정 창 \xc2\xb7 \xe2\x89\xa1 끌어서 순서 변경 \xc2\xb7 플러그인 \xc2\xb7 라우팅 \xc2\xb7 번호표는 프리셋으로 저장"),
-                     uiFont (13.5f), t.sub, { 18, 578, 404, 40 });
-    }
-
-    void paintOverChildren (juce::Graphics& g) override
-    {
-        if (! ctx.stereoOnly) return;
-        const auto& t = ctx.th();
-        const juce::Rectangle<float> v (12.0f, (float) kUpY0 - 4.0f, 416.0f, 2.0f * kUpStep + 44.0f);
-        g.setColour (t.panel.withAlpha (0.9f));
-        g.fillRect (v);
-        g.setColour (t.text);
-        g.setFont (uiFont (15.5f, true));
-        g.drawText (tr ("2ch Stereo: 업믹스는 AVR이 합니다"), v.withSizeKeepingCentre (404.0f, 22.0f).translated (0, -12).toNearestInt(), juce::Justification::centred);
-        g.setColour (t.sub);
-        g.setFont (uiFont (13.5f));
-        g.drawText (tr ("Dolby Surround \xc2\xb7 Auro-3D \xc2\xb7 Neural:X \xc2\xb7 VST 업믹서는 쉼 (지연 0)"),
-                    v.withSizeKeepingCentre (404.0f, 20.0f).translated (0, 12).toNearestInt(), juce::Justification::centred);
+        drawWrapped (g, tr ("업믹서 앞은 2ch, 뒤는 12ch \xc2\xb7 업믹서 뒤의 스테레오 플러그인은 CH 1-2(L/R)에 적용 \xc2\xb7 "
+                            "이름을 누르면 설정 창 \xc2\xb7 체인은 프리셋으로 저장"),
+                     uiFont (13.0f), t.sub, { 18, 576, 404, 40 });
     }
 
 private:
     void layoutRows()
     {
-        for (int i = 0; i < kMaxFxShown; ++i)
-            fxRows[(size_t) i]->setBounds (18, kFxY0 + i * kFxStep, 404, kFxH);
-        fxAdd.setBounds (18, kFxY0 + (int) juce::jmin ((int) fx.size(), kMaxFxShown) * kFxStep, 404, 34);
-        const int n = juce::jmin (2, proc.getNumSlots());
-        for (int i = 0; i < 2; ++i)
-            upRows[(size_t) i]->setBounds (18, kUpY0 + i * kUpStep, 404, kUpH);
-        upAdd.setBounds (18, kUpY0 + n * kUpStep, 404, 34);
+        for (int i = 0; i < kMaxRows; ++i)
+            rows[(size_t) i]->setBounds (18, kY0 + i * kStep, 404, kRowH);
+        addBtn.setBounds (18, kY0 + (int) juce::jmin ((int) chain.size(), kMaxRows) * kStep, 404, 36);
     }
 
     AtmosBridgeProcessor& proc;
     const UiCtx& ctx;
     juce::TextButton limBtn, bypassBtn;
-    std::array<std::unique_ptr<FxRow>, kMaxFxShown> fxRows;
-    std::array<std::unique_ptr<SlotRow>, 2> upRows;
-    AddButton fxAdd, upAdd;
+    std::array<std::unique_ptr<ChainRow>, kMaxRows> rows;
+    AddButton addBtn;
     bool shownLimiter = false, shownBypass = false, shownStereo = false, dirty = true;
-    int shownVersion = -1, shownCount = -1;
 };
 
 //==============================================================================
