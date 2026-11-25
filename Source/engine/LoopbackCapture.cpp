@@ -171,6 +171,7 @@ struct LoopbackCapture::Impl
     std::atomic<uint32_t> packets { 0 }, discontinuities { 0 };
     std::atomic<bool> keeperOk { false };
 
+    bool captureMode = false;   // the source is a recording device (e.g. CABLE Output): plain capture, no loopback
     // short engine period (Ultra low latency+)
     bool wantShort = false, shortAllowed = true, shortChecked = false, restartNow = false, reopenAtOnce = false;
     std::atomic<bool> shortActive { false }, trialPending { false };
@@ -267,7 +268,13 @@ struct LoopbackCapture::Impl
             return false;
         }
         const auto name = friendlyName (dev.Get());
-        if (name == excludeName)
+        captureMode = false;
+        {
+            ComPtr<IMMEndpoint> ep;
+            EDataFlow flow = eRender;
+            if (SUCCEEDED (dev.As (&ep)) && ep && SUCCEEDED (ep->GetDataFlow (&flow))) captureMode = flow == eCapture;
+        }
+        if (! captureMode && name == excludeName)
         {
             setStatus (LoopbackStatus::Error, "refusing to capture the Atmos output device (feedback)");
             return false;
@@ -295,8 +302,10 @@ struct LoopbackCapture::Impl
         device = dev;
         deviceId = idOf (dev.Get());
         mixCopy.assign (reinterpret_cast<const uint8_t*> (mix), reinterpret_cast<const uint8_t*> (mix) + sizeof (WAVEFORMATEX) + mix->cbSize);
-        bool tryShort = wantShort && shortAllowed;
-        if (tryShort && LoopbackCapture::isVirtualCable (name))
+        bool tryShort = wantShort && shortAllowed && ! captureMode;
+        if (captureMode)
+            periodNote.store ((int) PeriodNote::NotRequested);
+        else if (tryShort && LoopbackCapture::isVirtualCable (name))
         {
             tryShort = false;
             periodNote.store ((int) PeriodNote::SkippedVirtual);
@@ -308,10 +317,11 @@ struct LoopbackCapture::Impl
             periodNote.store ((int) PeriodNote::SkippedKnown);
             logLine ("Direct loopback: short engine period not requested (no effect on this device before)");
         }
-        openKeeper (tryShort);
+        if (! captureMode) openKeeper (tryShort);   // a recording device runs on its own
 
-        // Event-driven loopback; the 100 ms buffer only holds data if this thread is ever late (no added latency).
-        hr = capClient->Initialize (AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        // Event-driven loopback (or capture); the 100 ms buffer only holds data if this thread is ever late (no added latency).
+        hr = capClient->Initialize (AUDCLNT_SHAREMODE_SHARED,
+                                    (captureMode ? 0u : (DWORD) AUDCLNT_STREAMFLAGS_LOOPBACK) | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                     1000000, 0, mix, nullptr);
         if (SUCCEEDED (hr)) hr = capClient->SetEventHandle (captureEvent);
         if (SUCCEEDED (hr)) hr = capClient->GetService (__uuidof (IAudioCaptureClient), (void**) capture.ReleaseAndGetAddressOf());
@@ -340,8 +350,8 @@ struct LoopbackCapture::Impl
         }
         lastPacketUs.store (nowUs());
         char info[200];
-        std::snprintf (info, sizeof (info), "Direct loopback open: %.0f Hz, %d ch, buffer %u frames, keeper=%d  device=\"",
-                       sr, ch, (unsigned) bufFrames, keeperOk.load() ? 1 : 0);
+        std::snprintf (info, sizeof (info), "Direct %s open: %.0f Hz, %d ch, buffer %u frames, keeper=%d  device=\"",
+                       captureMode ? "capture (recording device)" : "loopback", sr, ch, (unsigned) bufFrames, keeperOk.load() ? 1 : 0);
         logLine (info + name + "\"");
         setStatus (LoopbackStatus::Running);
         return true;

@@ -49,6 +49,7 @@ const char* toString (EngineStatus s) noexcept
 #include <mmreg.h>
 #include <avrt.h>
 #include <wrl/client.h>
+#include <audiopolicy.h>
 #include "SpatialFormat.h"
 
 using Microsoft::WRL::ComPtr;
@@ -216,7 +217,7 @@ struct SpatialEngine::Impl
     std::atomic<uint32_t> reconnects { 0 };
 
     mutable std::mutex infoLock;
-    std::string deviceIdWanted, deviceName, lastError;
+    std::string deviceIdWanted, deviceName, lastError, connectedId;
 
     HANDLE wakeEvent = nullptr;   // device-change notifications / stop requests
     HANDLE bufferEvent = nullptr; // ISAC "ready for data" event
@@ -235,7 +236,7 @@ struct SpatialEngine::Impl
     // 2ch Stereo (WASAPI exclusive)
     std::atomic<bool> stereoWanted { false }, stereoActive { false };
     std::atomic<int> exWantFrames { 0 };
-    std::atomic<bool> autoEnableAtmos { false };   // 2ch exclusive buffer (frames at 48 kHz), 0 = device default period
+    std::atomic<bool> autoEnableAtmos { false };
     ComPtr<IAudioClient> exClient;
     ComPtr<IAudioRenderClient> exRender;
     UINT32 exFrames = 0;
@@ -413,6 +414,7 @@ struct SpatialEngine::Impl
         {
             std::lock_guard<std::mutex> g (infoLock);
             deviceName = deviceFriendlyName (device.Get());
+            connectedId = deviceId (device.Get());
         }
 
         if (stereo)
@@ -908,6 +910,11 @@ void SpatialEngine::requestReconnect()
 EngineStatus SpatialEngine::getStatus() const noexcept   { return (EngineStatus) impl->status.load(); }
 bool SpatialEngine::isReconnecting() const noexcept      { return impl->reconnecting.load(); }
 std::string SpatialEngine::getDeviceName() const         { return impl->getName(); }
+std::string SpatialEngine::getConnectedDeviceId() const
+{
+    std::lock_guard<std::mutex> g (impl->infoLock);
+    return impl->connectedId;
+}
 std::string SpatialEngine::getLastError() const
 {
     std::lock_guard<std::mutex> g (impl->infoLock);
@@ -953,6 +960,83 @@ std::vector<OutputDevice> SpatialEngine::listOutputDevices()
     if (coHr == S_OK || coHr == S_FALSE) CoUninitialize();
     return result;
 }
+
+std::vector<OutputDevice> SpatialEngine::listInputDevices()
+{
+    std::vector<OutputDevice> result;
+    const HRESULT coHr = CoInitializeEx (nullptr, COINIT_APARTMENTTHREADED);
+    ComPtr<IMMDeviceEnumerator> en;
+    if (SUCCEEDED (CoCreateInstance (__uuidof (MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof (IMMDeviceEnumerator), (void**) en.ReleaseAndGetAddressOf())))
+    {
+        ComPtr<IMMDeviceCollection> coll;
+        if (SUCCEEDED (en->EnumAudioEndpoints (eCapture, DEVICE_STATE_ACTIVE, &coll)))
+        {
+            UINT count = 0;
+            coll->GetCount (&count);
+            for (UINT i = 0; i < count; ++i)
+            {
+                ComPtr<IMMDevice> d;
+                if (FAILED (coll->Item (i, &d))) continue;
+                OutputDevice od;
+                od.id = deviceId (d.Get());
+                od.name = deviceFriendlyName (d.Get());
+                result.push_back (od);
+            }
+        }
+    }
+    if (coHr == S_OK || coHr == S_FALSE) CoUninitialize();
+    return result;
+}
+
+std::vector<std::string> SpatialEngine::otherActiveApps (const std::string& endpointId)
+{
+    std::vector<std::string> result;
+    if (endpointId.empty()) return result;
+    const HRESULT coHr = CoInitializeEx (nullptr, COINIT_APARTMENTTHREADED);
+    ComPtr<IMMDeviceEnumerator> en;
+    ComPtr<IMMDevice> dev;
+    ComPtr<IAudioSessionManager2> mgr;
+    ComPtr<IAudioSessionEnumerator> sessions;
+    if (SUCCEEDED (CoCreateInstance (__uuidof (MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof (IMMDeviceEnumerator), (void**) en.ReleaseAndGetAddressOf()))
+        && SUCCEEDED (en->GetDevice (toWide (endpointId).c_str(), &dev)) && dev
+        && SUCCEEDED (dev->Activate (__uuidof (IAudioSessionManager2), CLSCTX_ALL, nullptr, (void**) mgr.ReleaseAndGetAddressOf())) && mgr
+        && SUCCEEDED (mgr->GetSessionEnumerator (&sessions)) && sessions)
+    {
+        const DWORD self = GetCurrentProcessId();
+        int count = 0;
+        sessions->GetCount (&count);
+        for (int i = 0; i < count; ++i)
+        {
+            ComPtr<IAudioSessionControl> c;
+            ComPtr<IAudioSessionControl2> c2;
+            if (FAILED (sessions->GetSession (i, &c)) || ! c || FAILED (c.As (&c2)) || ! c2) continue;
+            AudioSessionState state = AudioSessionStateInactive;
+            DWORD pid = 0;
+            if (FAILED (c2->GetState (&state)) || state != AudioSessionStateActive) continue;
+            if (FAILED (c2->GetProcessId (&pid)) || pid == 0 || pid == self) continue;   // 0 = Windows system sounds
+            std::string name = "PID " + std::to_string (pid);
+            if (HANDLE h = OpenProcess (PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+            {
+                wchar_t path[MAX_PATH];
+                DWORD len = MAX_PATH;
+                if (QueryFullProcessImageNameW (h, 0, path, &len))
+                {
+                    std::wstring p (path, len);
+                    const auto slash = p.find_last_of (L"\\/");
+                    std::wstring file = slash == std::wstring::npos ? p : p.substr (slash + 1);
+                    const int n = WideCharToMultiByte (CP_UTF8, 0, file.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                    std::string u ((size_t) (n > 0 ? n - 1 : 0), '\0');
+                    if (n > 1) WideCharToMultiByte (CP_UTF8, 0, file.c_str(), -1, u.data(), n, nullptr, nullptr);
+                    if (! u.empty()) name = u;
+                }
+                CloseHandle (h);
+            }
+            if (std::find (result.begin(), result.end(), name) == result.end()) result.push_back (name);
+        }
+    }
+    if (coHr == S_OK || coHr == S_FALSE) CoUninitialize();
+    return result;
+}
 } // namespace ab
 
 //==============================================================================
@@ -982,6 +1066,9 @@ int SpatialEngine::getPeriodFrames() const noexcept { return 480; }
 uint32_t SpatialEngine::getReconnectCount() const noexcept { return 0; }
 bool SpatialEngine::isMemoryLocked() const noexcept { return false; }
 std::vector<OutputDevice> SpatialEngine::listOutputDevices() { return {}; }
+std::vector<OutputDevice> SpatialEngine::listInputDevices() { return {}; }
+std::vector<std::string> SpatialEngine::otherActiveApps (const std::string&) { return {}; }
+std::string SpatialEngine::getConnectedDeviceId() const { return {}; }
 } // namespace ab
 
 #endif

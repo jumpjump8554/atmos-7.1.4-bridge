@@ -62,6 +62,10 @@ public:
     bool isMemoryLocked() const noexcept;
 
     static std::vector<OutputDevice> listOutputDevices();
+    static std::vector<OutputDevice> listInputDevices();     // recording devices (e.g. CABLE Output)
+    // Other applications that are playing to this device right now (exe names; not this process, not system sounds)
+    static std::vector<std::string> otherActiveApps (const std::string& endpointId);
+    std::string getConnectedDeviceId() const;                 // the device in use (also when chosen automatically)
 
     // Virtual audio cables (VB-Audio, VoiceMeeter, ...): the host usually captures from these,
     // so sending the Atmos output there creates a feedback loop. Never picked automatically.

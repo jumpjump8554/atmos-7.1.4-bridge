@@ -25,7 +25,7 @@ MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰�
 | 위치 | 기능 |
 |---|---|
 | 상단 | 상태 · **출력 형식 [2ch Stereo \| Atmos 7.1.4]** · 모드 [기본 \| 저지연] |
-| INPUT | 플레이어가 소리를 내보내는 장치 (자동 = CABLE In 16ch, 없으면 CABLE In). 직접 루프백으로 받습니다 |
+| INPUT | **재생 장치**(자동 = CABLE In 16ch, 없으면 CABLE Input): 플레이어가 그 장치로 내보내는 소리를 직접 받음(루프백, 가장 빠름) · **녹음 장치**(CABLE Output 등): 일반 녹음 입력, VB-Cable 내부 버퍼만큼 늦음. 입력이 44.1 kHz 등이면 그 레이트로 처리 |
 | ENGINE | 48000 Hz · **Buffer** (2ch: 128 / 256 / 480 / 512 / 1024 samples = 2.7 / 5.3 / 10 / 10.7 / 21.3 ms, 기본 480 · Atmos: 10 ms 고정) · **Exclusive** (2ch: 항상 켜짐, Atmos: 사용 불가) |
 | OUTPUT | AVR (자동 = AVR/HDMI 우선) |
 | ROUTING | 입력 16채널 → 처리 12채널 매트릭스, 입력별 레벨 · 뮤트, 두 번째 탭은 번호표(처리 → 스피커) |
@@ -70,6 +70,10 @@ MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰�
 - 오른쪽 클릭 메뉴: 창 열기 · 출력 형식 · 모드 · BYPASS · MUTE · **최소화하면 트레이로 / 닫기(X)도 트레이로 / Windows 시작 시 트레이로 자동 실행** · **종료**.
   처음에는 최소화·닫기 → 트레이가 켜져 있고, 자동 실행은 꺼져 있습니다. 프로그램을 끝내려면 트레이 메뉴의 **종료**.
 - 한 번만 실행됩니다 (다시 실행하면 열려 있는 창이 앞으로 나옵니다).
+
+**소리가 두 번(겹쳐) 들릴 때** — 같은 AVR로 소리를 내는 다른 프로그램이 있으면 상태 표시가 주황색 **"다른 앱도 AVR로 출력 중: (프로그램 이름)"**으로 알려 줍니다.
+흔한 경우: MultiChannel Plugin Host(+ Atmos Bridge 플러그인)가 아직 켜져 있음 · 플레이어가 CABLE이 아니라 AVR로도 출력 · CABLE Output의 "이 장치로 듣기"가 켜져 있음.
+확인: Atmos Bridge Host의 **MUTE**를 눌러도 소리가 나면 다른 경로가 있는 것입니다. 체인의 RoomSpace 같은 공간 효과 플러그인도 겹쳐 들리는 느낌을 줄 수 있으니 **B**로 비교해 보세요.
 
 **로그** — `다운로드\AtmosBridge\Logs\atmosbridge-host.log`
 

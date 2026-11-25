@@ -437,6 +437,14 @@ void AtmosBridgeProcessor::updateDirect()
     }
 
     const auto ls = loopback->getStatus();
+    if (hostApp && ls == LoopbackStatus::Running && loopback->getSampleRate() > 0.0
+        && std::abs (loopback->getSampleRate() - currentSampleRate) > 1.0)
+    {
+        // The host app follows its input's rate (the output side converts to the device rate).
+        if (directActive.load()) deactivateDirect ("input sample rate changed", 0);
+        logLine ("Host app: input runs at " + std::to_string ((int) loopback->getSampleRate()) + " Hz -> processing at that rate");
+        prepareToPlay (loopback->getSampleRate(), currentBlockSize);
+    }
     juce::String problem;
     int retryMs = 3000;
     bool connecting = false;

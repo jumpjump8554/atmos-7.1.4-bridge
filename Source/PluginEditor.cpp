@@ -3437,7 +3437,8 @@ public:
         };
         addAndMakeVisible (themeBox);
 
-        inBox.setTooltip (tr ("플레이어가 소리를 내보내는 장치 (CABLE In). Atmos Bridge가 직접 받습니다(루프백). 입력 주기는 Windows가 정함(10 ms)."));
+        inBox.setTooltip (tr ("입력. 재생 장치(CABLE In 16ch / CABLE Input)를 고르면 플레이어가 그 장치로 내보내는 소리를 직접 받습니다(루프백, 가장 빠름). "
+                              "녹음 장치(CABLE Output)도 고를 수 있지만 VB-Cable 내부 버퍼만큼 늦습니다."));
         inBox.beforePopup = [this] { fillInputs(); };
         inBox.onChange = [this]
         {
@@ -3650,6 +3651,15 @@ public:
             if (idx >= 0 && outBox.getSelectedItemIndex() != idx) outBox.setSelectedItemIndex (idx, juce::dontSendNotification);
         }
 
+        if (++otherTick % 60 == 1)   // every 2 s: other applications playing to the same device (sound heard twice)
+        {
+            juce::StringArray names;
+            if (auto* s = proc.getSharedOutput())
+                for (const auto& n : SpatialEngine::otherActiveApps (s->engine.getConnectedDeviceId()))
+                    names.add (juce::String::fromUTF8 (n.c_str()));
+            otherApps = names.joinIntoString (", ");
+        }
+
         updateTexts();
         repaintLive (kHStatus.expanded (2).toNearestInt());
         repaintLive (kHRate.expanded (2).toNearestInt());
@@ -3733,12 +3743,19 @@ private:
         inBox.addItem (tr ("자동 (CABLE In 16ch / CABLE In)"), 1);
         int id = 2;
         const auto outId = proc.getOutputDeviceId();
+        inBox.addSectionHeading (tr ("재생 장치를 직접 받기 (루프백 \xc2\xb7 저지연)"));
         for (const auto& d : SpatialEngine::listOutputDevices())
         {
             const auto devId = juce::String::fromUTF8 (d.id.c_str());
             if (devId == outId) continue;                 // never loop back the output itself
             inIds.add (devId);
             inBox.addItem (juce::String::fromUTF8 (d.name.c_str()), id++);
+        }
+        inBox.addSectionHeading (tr ("녹음 장치 (VB-Cable 내부 버퍼만큼 지연 추가)"));
+        for (const auto& d : SpatialEngine::listInputDevices())
+        {
+            inIds.add (juce::String::fromUTF8 (d.id.c_str()));
+            inBox.addItem (juce::String::fromUTF8 (d.name.c_str()) + tr (" \xc2\xb7 녹음"), id++);
         }
         const auto want = proc.getDirectSourceId();
         if (want.isNotEmpty() && want != "host" && ! inIds.contains (want))
@@ -3820,6 +3837,18 @@ private:
             runText = tr ("정지");
         }
 
+        if (running && otherApps.isNotEmpty())
+        {
+            statusColour = t.amber;
+            statusText = tr ("다른 앱도 AVR로 출력 중: ") + otherApps + tr (" (소리가 겹쳐 들림)");
+            tip << tr ("\n같은 AVR로 소리를 내는 다른 앱: ") << otherApps;
+        }
+        else if (otherApps.isNotEmpty() && proc.getSharedOutput() != nullptr
+                 && proc.getSharedOutput()->engine.getStatus() == EngineStatus::Busy)
+        {
+            statusText = tr ("2ch: AVR을 사용 중인 앱: ") + otherApps;
+        }
+
         // Input problems (CABLE In missing, loopback stalled, ...) show while the output itself is fine.
         if (running && ds.reason.isNotEmpty() && ds.state != DS::Running && ds.state != DS::Settling)
         {
@@ -3893,7 +3922,8 @@ private:
     std::array<std::unique_ptr<HostedPluginWindow>, kNumWindowKeys> windows;
     std::unique_ptr<juce::DocumentWindow> routingWin;
     RoutingView* routingView = nullptr;
-    int lastMode = -1, lastStereo = -1, lastMuted = -1, dropouts = 0;
+    int lastMode = -1, lastStereo = -1, lastMuted = -1, dropouts = 0, otherTick = 0;
+    juce::String otherApps;
     juce::Colour statusColour { juce::Colours::grey }, runColour { juce::Colours::grey };
     juce::String statusText, rateText { "48000 Hz" }, latencyHead, latencyText, testText, runText, lastTip;
 };
