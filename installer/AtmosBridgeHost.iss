@@ -12,6 +12,7 @@
 #endif
 
 [Setup]
+; OutputBaseFilename: CI gives the versioned name with /F
 AppId={{42023C7F-3C1D-4B27-823A-7822775012E4}
 AppName={#AppName}
 AppVersion={#AppVersion}

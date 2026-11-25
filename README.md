@@ -1,11 +1,12 @@
 # Atmos Bridge 7.1.4ch
 
-**v2.0부터 두 가지로 받을 수 있습니다.**
+**다운로드** ([Releases](https://github.com/jumpjump8554/atmos-7.1.4-bridge/releases/latest), 파일 이름에 버전 포함)
 
 | 다운로드 | 무엇 |
 |---|---|
-| `Atmos-Bridge-Host-win64.zip` | **Atmos Bridge Host** — 호스트 없이 혼자 실행되는 프로그램 (아래 "0. Atmos Bridge Host") |
-| `Atmos-Bridge-7.1.4ch-VST3-win64.zip` | **VST3 플러그인** — 지금까지처럼 MultiChannel Plugin Host 안에서 사용 (1장부터) |
+| `Atmos-Bridge-Host-v<버전>-Install-win64.exe` | **Install 버전**: Atmos Bridge Host 설치 파일 (아래 "0. Atmos Bridge Host") |
+| `Atmos-Bridge-Host-v<버전>-Portable-win64.zip` | **Portable 버전**: 설치 없이 아무 폴더에 풀어서 실행 |
+| `Atmos-Bridge-7.1.4ch-v<버전>-VST3-win64.zip` | **VST3 버전**: 지금까지처럼 MultiChannel Plugin Host 안에서 사용 (1장부터) |
 
 ---
 
@@ -17,7 +18,10 @@
   → 2ch Stereo:   WASAPI Exclusive 모드 PCM 2.0 → AVR 업믹서 (Dolby Surround · Auro-3D · Neural:X)
 ```
 
-**설치** — `Atmos-Bridge-Host-win64.zip`을 풀어 아무 폴더(예: `C:\Atmos Bridge Host`)에 두고 `Atmos Bridge Host.exe`를 실행합니다. 설치 과정은 없습니다.
+**설치**
+- **Install 버전**: `...-Install-win64.exe`를 실행합니다. `C:\Program Files\Atmos Bridge Host`에 설치되고 **시작 메뉴** 바로가기가 생깁니다. **바탕화면 바로가기**와 **VST3 플러그인 함께 설치**는 설치 화면에서 고릅니다. 새 버전도 같은 방법으로 덮어 설치하면 됩니다(실행 중이면 닫고 설치, 설정은 그대로). 제거: **설정 > 앱 > 설치된 앱 > Atmos Bridge Host**.
+- **Portable 버전**: zip을 풀어 아무 폴더(예: `C:\Atmos Bridge Host`)에 두고 `Atmos Bridge Host.exe`를 실행합니다.
+- 두 버전은 같은 설정(`%APPDATA%\Atmos Bridge Host`)을 씁니다. 서명되지 않은 프로그램이라 처음 실행할 때 SmartScreen 경고가 뜨면 **추가 정보 → 실행**.
 MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰면 2ch Exclusive 모드가 열리지 않고, 두 번 출력될 수 있습니다).
 
 **화면** — 플러그인과 같은 스피커 배치 · 채널 매핑(번호표) · 테마에 호스트 기능이 더해졌습니다.
@@ -26,7 +30,7 @@ MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰�
 |---|---|
 | 상단 | 상태 · **출력 형식 [2ch Stereo \| Atmos 7.1.4]** · 모드 [기본 \| 저지연] |
 | INPUT | **재생 장치**(자동 = CABLE In 16ch, 없으면 CABLE Input): 플레이어가 그 장치로 내보내는 소리를 직접 받음(루프백, 가장 빠름) · **녹음 장치**(CABLE Output 등): 일반 녹음 입력, VB-Cable 내부 버퍼만큼 늦음. 입력이 44.1 kHz 등이면 그 레이트로 처리 |
-| ENGINE | 48000 Hz · **Buffer** (2ch: 128 / 256 / 480 / 512 / 1024 samples = 2.7 / 5.3 / 10 / 10.7 / 21.3 ms, 기본 480 · Atmos: 10 ms 고정) · **Exclusive** (2ch: 항상 켜짐, Atmos: 사용 불가) |
+| ENGINE | 48000 Hz · **Buffer** (2ch: 128 / 256 / 480 / 512 / 1024 samples = 2.7 / 5.3 / 10 / 10.7 / 21.3 ms, 기본 480 · Atmos: 10 ms 고정) · **Exclusive** (2ch: 눌러서 켜기/끄기, 기본 켬 · Atmos: 사용 불가) |
 | OUTPUT | AVR (자동 = AVR/HDMI 우선) |
 | ROUTING | 입력 16채널 → 처리 12채널 매트릭스, 입력별 레벨 · 뮤트, 두 번째 탭은 번호표(처리 → 스피커) |
 | ⤓ | 트레이로 숨기기 |
@@ -45,6 +49,7 @@ MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰�
 - PCM 2.0(48 kHz 24-bit 우선)을 **Exclusive 모드**로 AVR에 보냅니다. Windows 믹서와 공간 음향을 거치지 않으므로 AVR이 PCM을 받고 업믹서를 쓸 수 있습니다.
 - AVR 장치 속성 → 고급 → **"응용 프로그램이 이 장치를 단독으로 제어하도록 허용"**이 켜져 있어야 합니다 (꺼져 있으면 상태에 "Exclusive 모드 꺼짐").
 - 출력하는 동안 다른 앱(알림음 등)은 AVR로 소리를 낼 수 없습니다. 다른 앱이 AVR을 쓰고 있으면 상태에 "AVR을 다른 앱이 사용 중".
+- **Exclusive를 끄면(공유 모드)** Windows 믹서를 거쳐 나가서 다른 앱 소리도 AVR로 함께 나옵니다. 대신 지연이 늘고(Windows 버퍼, 보통 20 ms 안팎) Buffer 선택은 쓰지 않습니다. Windows 공간 음향(Dolby Atmos for home theater)이 켜져 있으면 2ch도 Atmos 신호로 나가므로 AVR 업믹서를 쓸 수 없습니다. 이때는 소리 설정에서 공간 음향을 끄세요(Atmos 7.1.4로 돌아가면 자동으로 다시 켜 봅니다).
 - Buffer를 줄이면 지연이 줄지만 끊김 위험이 커집니다 (AVR 드라이버의 최소 주기보다 작게는 열리지 않습니다). 기본 480 samples(10 ms)에서 시작해 끊김이 없으면 256 · 128로 줄여 보세요.
 - XTC(zBACCH 등)를 쓸 때는 AVR을 **Stereo**(또는 Direct) 모드로 두세요.
 
@@ -88,7 +93,7 @@ HDMI LPCM의 8채널 한계를 넘어 7.1.4 12채널을 리시버가 Dolby Atmos
 
 ## 1. 다운로드와 설치
 
-1. 이 저장소의 **Releases**에서 `Atmos-Bridge-7.1.4ch-VST3-win64.zip`을 내려받습니다.
+1. 이 저장소의 **Releases**에서 `Atmos-Bridge-7.1.4ch-v<버전>-VST3-win64.zip`(VST3 버전)을 내려받습니다.
 2. 압축을 풀고 `Atmos Bridge 7.1.4ch.vst3` **폴더 전체**를 `C:\Program Files\Common Files\VST3`에 복사합니다.
 3. 호스트에서 **Rescan**을 눌러 플러그인 목록을 새로 고칩니다.
 

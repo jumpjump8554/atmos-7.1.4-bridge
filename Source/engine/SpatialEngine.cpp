@@ -235,6 +235,7 @@ struct SpatialEngine::Impl
 
     // 2ch Stereo (WASAPI exclusive)
     std::atomic<bool> stereoWanted { false }, stereoActive { false };
+    std::atomic<bool> exclusiveWanted { true }, sharedActive { false };   // 2ch: exclusive (default) or shared mode
     std::atomic<int> exWantFrames { 0 };
     std::atomic<bool> autoEnableAtmos { false };
     ComPtr<IAudioClient> exClient;
@@ -279,6 +280,7 @@ struct SpatialEngine::Impl
         exRender.Reset();
         exClient.Reset();
         stereoActive.store (false);
+        sharedActive.store (false);
     }
 
     // Atmos: spatial sound is off for this device -> try to select "Dolby Atmos for home theater"
@@ -418,7 +420,7 @@ struct SpatialEngine::Impl
         }
 
         if (stereo)
-            return connectExclusive (device.Get());
+            return exclusiveWanted.load() ? connectExclusive (device.Get()) : connectShared (device.Get());
 
         hr = device->Activate (__uuidof (ISpatialAudioClient), CLSCTX_INPROC_SERVER, nullptr, (void**) client.ReleaseAndGetAddressOf());
         if (FAILED (hr) || ! client)
@@ -644,6 +646,123 @@ struct SpatialEngine::Impl
         return true;
     }
 
+    // 2ch Stereo, shared mode: through the Windows mixer (other applications can play to the device too).
+    // 2ch float at the mixer's rate; Windows converts it to the device's channel layout.
+    bool connectShared (IMMDevice* device)
+    {
+        HRESULT hr = device->Activate (__uuidof (IAudioClient), CLSCTX_ALL, nullptr, (void**) exClient.ReleaseAndGetAddressOf());
+        if (FAILED (hr) || ! exClient)
+        {
+            setStatus (EngineStatus::Error, "IAudioClient activation failed " + hrToString (hr));
+            return false;
+        }
+        WAVEFORMATEX* mix = nullptr;
+        hr = exClient->GetMixFormat (&mix);
+        if (FAILED (hr) || mix == nullptr)
+        {
+            setStatus (EngineStatus::Error, "GetMixFormat failed " + hrToString (hr));
+            exClient.Reset();
+            return false;
+        }
+        const DWORD rate = mix->nSamplesPerSec > 0 ? mix->nSamplesPerSec : 48000;
+        const unsigned mixChannels = mix->nChannels;
+        CoTaskMemFree (mix);
+
+        WAVEFORMATEXTENSIBLE fmt {};
+        fmt.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
+        fmt.Format.nChannels = 2;
+        fmt.Format.nSamplesPerSec = rate;
+        fmt.Format.wBitsPerSample = 32;
+        fmt.Format.nBlockAlign = 8;
+        fmt.Format.nAvgBytesPerSec = rate * 8;
+        fmt.Format.cbSize = 22;
+        fmt.Samples.wValidBitsPerSample = 32;
+        fmt.dwChannelMask = 0x3;
+        fmt.SubFormat = kSubtypeFloat;
+
+        const DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        hr = exClient->Initialize (AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &fmt.Format, nullptr);
+        if (FAILED (hr))
+        {
+            exClient.Reset();
+            setStatus (EngineStatus::Error, "Shared 2ch Initialize failed " + hrToString (hr));
+            return false;
+        }
+        exClient->SetEventHandle (bufferEvent);
+        exClient->GetBufferSize (&exFrames);
+        hr = exClient->GetService (__uuidof (IAudioRenderClient), (void**) exRender.ReleaseAndGetAddressOf());
+        if (FAILED (hr) || ! exRender || exFrames == 0)
+        {
+            setStatus (EngineStatus::Error, "Shared render client failed " + hrToString (hr));
+            disconnect();
+            return false;
+        }
+        REFERENCE_TIME defPeriod = 0, minPeriod = 0;
+        exClient->GetDevicePeriod (&defPeriod, &minPeriod);
+
+        exKind = SampleKind::Float32;
+        exBytes = 4;
+        exBuf.assign (12, std::vector<float> (std::max<size_t> (exFrames, 4096), 0.0f));
+        outRate.store ((double) rate);
+        periodFrames.store ((int) exFrames);   // the buffer is kept full: its length is the output delay
+        maxDynamic.store (0);
+        feeder.consumerStart ((double) rate);
+
+        hr = exClient->Start();
+        if (FAILED (hr))
+        {
+            setStatus (EngineStatus::Error, "Shared 2ch Start failed " + hrToString (hr));
+            disconnect();
+            return false;
+        }
+        stereoActive.store (true);
+        sharedActive.store (true);
+
+        char info[256];
+        std::snprintf (info, sizeof (info), "Connected (2ch shared): %u Hz float, mixer %u ch, buffer %u frames (%.1f ms), device period %.1f ms",
+                       (unsigned) rate, mixChannels, (unsigned) exFrames, 1000.0 * exFrames / rate, defPeriod / 10000.0);
+        logLine (info + std::string ("  device=\"") + getName() + "\"");
+        setStatus (EngineStatus::Running);
+        return true;
+    }
+
+    // One shared-mode event: top the buffer up. Returns false if the stream must be reconnected.
+    bool renderShared()
+    {
+        UINT32 padding = 0;
+        HRESULT hr = exClient->GetCurrentPadding (&padding);
+        if (FAILED (hr))
+        {
+            logLine ("Shared GetCurrentPadding failed " + hrToString (hr) + " -> reconnect");
+            return false;
+        }
+        const UINT32 n = padding < exFrames ? exFrames - padding : 0;
+        if (n == 0) return true;
+        BYTE* data = nullptr;
+        hr = exRender->GetBuffer (n, &data);
+        if (FAILED (hr) || data == nullptr)
+        {
+            logLine ("Shared GetBuffer failed " + hrToString (hr) + " -> reconnect");
+            return false;
+        }
+        float* out[12];
+        for (int k = 0; k < 12; ++k) out[k] = exBuf[(size_t) k].data();
+        feeder.render (out, (int) n);   // positions L/R carry the 2ch signal
+        auto* f = reinterpret_cast<float*> (data);
+        for (UINT32 i = 0; i < n; ++i)
+        {
+            f[2 * i]     = std::max (-1.0f, std::min (1.0f, out[0][i]));
+            f[2 * i + 1] = std::max (-1.0f, std::min (1.0f, out[1][i]));
+        }
+        hr = exRender->ReleaseBuffer (n, 0);
+        if (FAILED (hr))
+        {
+            logLine ("Shared ReleaseBuffer failed " + hrToString (hr) + " -> reconnect");
+            return false;
+        }
+        return true;
+    }
+
     // One exclusive period: the whole buffer. Returns false if the stream must be reconnected.
     bool renderExclusive()
     {
@@ -817,7 +936,7 @@ struct SpatialEngine::Impl
             }
             timeouts = 0;
 
-            if (! (stereoActive.load() ? renderExclusive() : renderOnce()))
+            if (! (stereoActive.load() ? (sharedActive.load() ? renderShared() : renderExclusive()) : renderOnce()))
             {
                 disconnect();
                 connected = false;
@@ -900,6 +1019,14 @@ void SpatialEngine::setStereo (bool stereo2ch)
 }
 
 bool SpatialEngine::isStereoActive() const noexcept { return impl->stereoActive.load(); }
+bool SpatialEngine::isSharedActive() const noexcept { return impl->sharedActive.load(); }
+
+void SpatialEngine::setStereoExclusive (bool exclusive)
+{
+    if (impl->exclusiveWanted.exchange (exclusive) == exclusive) return;
+    logLine (std::string ("2ch output mode: ") + (exclusive ? "exclusive" : "shared"));
+    if (impl->stereoWanted.load()) requestReconnect();
+}
 
 void SpatialEngine::requestReconnect()
 {
@@ -1054,6 +1181,8 @@ void SpatialEngine::setStereo (bool) {}
 void SpatialEngine::setExclusiveBufferFrames (int) {}
 void SpatialEngine::setAutoEnableAtmos (bool) {}
 bool SpatialEngine::isStereoActive() const noexcept { return false; }
+bool SpatialEngine::isSharedActive() const noexcept { return false; }
+void SpatialEngine::setStereoExclusive (bool) {}
 std::string SpatialEngine::getDeviceId() const { return {}; }
 void SpatialEngine::requestReconnect() {}
 EngineStatus SpatialEngine::getStatus() const noexcept { return EngineStatus::Unsupported; }

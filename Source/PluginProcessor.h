@@ -174,6 +174,8 @@ public:
     int getExclusiveBufferFrames() const noexcept { return exclusiveFrames; }   // 2ch exclusive buffer at 48 kHz
     static constexpr std::array<int, 5> kExclusiveBuffers { 128, 256, 480, 512, 1024 };
     void setExclusiveBufferFrames (int frames);
+    bool isStereoExclusive() const noexcept { return stereoExclusive; }   // 2ch: exclusive (default) or shared mode
+    void setStereoExclusive (bool on);
 
     float getMasterDb() const noexcept { return masterDb.load(); }
     void setMasterDb (float db);
@@ -343,6 +345,7 @@ private:
     bool hostApp = false;
     std::atomic<int> outputFormat { 0 };
     int exclusiveFrames = 480;
+    bool stereoExclusive = true;
     std::atomic<float> masterDb { 0.0f };
     std::atomic<bool> masterMute { false };
     float masterNow = 1.0f;

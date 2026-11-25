@@ -47,7 +47,9 @@ public:
     void setStereo (bool stereo2ch);                  // true = 2ch PCM, WASAPI exclusive (reconnects)
     void setExclusiveBufferFrames (int frames48k);   // 2ch exclusive buffer (= output latency), 0 = device default
     void setAutoEnableAtmos (bool on);                // Atmos: select "Dolby Atmos for home theater" when it is off
-    bool isStereoActive() const noexcept;             // the running connection is the 2ch exclusive one
+    bool isStereoActive() const noexcept;             // the running connection is the 2ch one (exclusive or shared)
+    void setStereoExclusive (bool exclusive);         // 2ch: exclusive (default) or shared mode via the Windows mixer (reconnects)
+    bool isSharedActive() const noexcept;             // the running 2ch connection is in shared mode
     std::string getDeviceId() const;
     void requestReconnect();
 

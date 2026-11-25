@@ -123,6 +123,7 @@ void AtmosBridgeProcessor::tryClaimOutput()
     {
         shared->engine.setAutoEnableAtmos (true);
         shared->engine.setExclusiveBufferFrames (exclusiveFrames);
+        shared->engine.setStereoExclusive (stereoExclusive);
         shared->engine.setStereo (getOutputFormat() == OutputFormat::Stereo);
     }
     shared->engine.start();
@@ -1349,6 +1350,7 @@ void AtmosBridgeProcessor::setHostApp (bool on)
     {
         s->engine.setAutoEnableAtmos (on);
         s->engine.setExclusiveBufferFrames (exclusiveFrames);
+        s->engine.setStereoExclusive (stereoExclusive);
         s->engine.setStereo (on && getOutputFormat() == OutputFormat::Stereo);
     }
     writeExtrasToState();
@@ -1391,6 +1393,16 @@ void AtmosBridgeProcessor::setExclusiveBufferFrames (int frames)
     if (auto* s = getSharedOutput()) s->engine.setExclusiveBufferFrames (exclusiveFrames);
     writeExtrasToState();
     stateChanged();
+}
+
+void AtmosBridgeProcessor::setStereoExclusive (bool on)
+{
+    if (stereoExclusive == on) return;
+    stereoExclusive = on;
+    if (auto* s = getSharedOutput()) s->engine.setStereoExclusive (on);
+    writeExtrasToState();
+    stateChanged();
+    logLine (std::string ("2ch Exclusive: ") + (on ? "on" : "off (shared mode)"));
 }
 
 void AtmosBridgeProcessor::setMasterDb (float db)
@@ -1746,7 +1758,9 @@ double AtmosBridgeProcessor::getOutputPeriodMs() const noexcept
         const double rate = s->engine.getOutputRate();
         if (pf > 0 && rate > 0.0 && s->engine.getStatus() == EngineStatus::Running) return 1000.0 * pf / rate;
     }
-    return getOutputFormat() == OutputFormat::Stereo ? 1000.0 * exclusiveFrames / 48000.0 : 10.0;
+    if (getOutputFormat() == OutputFormat::Stereo)
+        return stereoExclusive ? 1000.0 * exclusiveFrames / 48000.0 : 20.0;   // shared: Windows' buffer, typically ~20 ms
+    return 10.0;
 }
 
 void AtmosBridgeProcessor::unloadAllFx()
@@ -1761,6 +1775,7 @@ void AtmosBridgeProcessor::writeHostState (juce::ValueTree& s)
 {
     s.setProperty ("hostFormat", outputFormat.load(), nullptr);
     s.setProperty ("exclusiveFrames", exclusiveFrames, nullptr);
+    s.setProperty ("stereoExclusive", stereoExclusive, nullptr);
     s.setProperty ("masterDb", (double) masterDb.load(), nullptr);
     s.setProperty ("masterMute", masterMute.load(), nullptr);
 
@@ -1830,11 +1845,13 @@ void AtmosBridgeProcessor::readHostState (const juce::ValueTree& s)
         const int f = (int) s.getProperty ("exclusiveFrames", 480);
         exclusiveFrames = std::find (kExclusiveBuffers.begin(), kExclusiveBuffers.end(), f) != kExclusiveBuffers.end() ? f : 480;
     }
+    stereoExclusive = (bool) s.getProperty ("stereoExclusive", true);
     masterDb.store (juce::jlimit (-60.0f, 0.0f, (float) (double) s.getProperty ("masterDb", 0.0)));
     masterMute.store ((bool) s.getProperty ("masterMute", false));
     if (auto* sh = getSharedOutput())
     {
         sh->engine.setExclusiveBufferFrames (exclusiveFrames);
+        sh->engine.setStereoExclusive (stereoExclusive);
         sh->engine.setStereo (hostApp && getOutputFormat() == OutputFormat::Stereo);
     }
 

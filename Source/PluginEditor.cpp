@@ -3430,12 +3430,24 @@ public:
         for (const int b : AtmosBridgeProcessor::kExclusiveBuffers)
             bufBox.addItem (juce::String (b) + tr (" samples \xc2\xb7 ") + juce::String (b / 48.0, b % 48 == 0 ? 0 : 1) + " ms", b);
         bufBox.addItem (tr ("출력 10 ms (Windows 고정)"), 1);
-        bufBox.onChange = [this] { if (bufBox.getSelectedId() > 1) proc.setExclusiveBufferFrames (bufBox.getSelectedId()); };
+        bufBox.addItem (tr ("Windows 공유 버퍼 (자동)"), 2);
+        bufBox.onChange = [this] { if (bufBox.getSelectedId() > 2) proc.setExclusiveBufferFrames (bufBox.getSelectedId()); };
         bufBox.setTooltip (tr ("2ch Exclusive 모드의 출력 버퍼 = 출력 지연. 작을수록 빠르지만 끊김 위험. AVR(HDMI) 드라이버의 최소 주기보다 작게는 안 됩니다."));
         addAndMakeVisible (bufBox);
 
-        excl.setTooltip (tr ("2ch Stereo는 Exclusive 모드로만 출력합니다: Windows 믹서와 공간 음향을 거치지 않아야 AVR이 PCM 2.0을 받고 업믹서를 쓸 수 있습니다. "
-                             "출력 중에는 다른 앱 소리가 AVR로 나가지 않습니다. Atmos는 공간 음향 방식이라 Exclusive 모드를 쓸 수 없습니다."));
+        excl.setTooltip (tr ("2ch Exclusive 켜기/끄기 (누를 때마다 바뀜)\n"
+                             "켬(기본): Windows 믹서와 공간 음향을 거치지 않아 AVR이 PCM 2.0을 받고 AVR 업믹서를 쓸 수 있습니다. 버퍼 선택 적용. "
+                             "출력 중에는 다른 앱 소리가 AVR로 나가지 않습니다.\n"
+                             "끔(공유 모드): Windows 믹서를 거쳐 다른 앱 소리도 함께 나갑니다. 지연이 늘고(Windows 버퍼) 버퍼 선택은 쓰지 않습니다. "
+                             "Windows 공간 음향(Dolby Atmos for home theater)이 켜져 있으면 2ch도 Atmos 신호로 나가 AVR 업믹서를 쓸 수 없습니다.\n"
+                             "Atmos 7.1.4는 공간 음향 방식이라 Exclusive를 쓸 수 없습니다."));
+        excl.setMouseCursor (juce::MouseCursor::PointingHandCursor);
+        excl.onClick = [this]
+        {
+            if (proc.getOutputFormat() == OutputFormat::Stereo)
+                proc.setStereoExclusive (! proc.isStereoExclusive());
+            refresh();
+        };
         addAndMakeVisible (excl);
 
         outBox.setTooltip (tr ("출력 장치 (AVR). '자동'은 AVR/HDMI 장치를 우선으로 고릅니다."));
@@ -3588,15 +3600,17 @@ public:
             lastMode = mode;
             for (int m = 0; m < kHostModes; ++m) segment (modeBtn[(size_t) m], m == mode);
         }
-        const int st = stereo ? 1 : 0;
-        if (st != lastStereo || bufBox.getSelectedId() != (stereo ? proc.getExclusiveBufferFrames() : 1))
+        const bool exclusive = proc.isStereoExclusive();
+        const int st = stereo ? (exclusive ? 1 : 2) : 0;
+        const int bufId = stereo ? (exclusive ? proc.getExclusiveBufferFrames() : 2) : 1;
+        if (st != lastStereo || bufBox.getSelectedId() != bufId)
         {
             lastStereo = st;
             segment (fmtBtn[0], stereo);
             segment (fmtBtn[1], ! stereo);
-            bufBox.setSelectedId (stereo ? proc.getExclusiveBufferFrames() : 1, juce::dontSendNotification);
-            bufBox.setEnabled (stereo);
-            excl.checked = stereo;
+            bufBox.setSelectedId (bufId, juce::dontSendNotification);
+            bufBox.setEnabled (stereo && exclusive);
+            excl.checked = stereo && exclusive;
             excl.setEnabled (stereo);
             excl.repaint();
         }
@@ -3816,7 +3830,13 @@ private:
             runText = tr ("정지");
         }
 
-        if (running && otherApps.isNotEmpty())
+        // 2ch shared mode: other apps playing to the AVR is what it is for (named in the tooltip only).
+        const bool sharedOut = proc.getSharedOutput() != nullptr && proc.getSharedOutput()->engine.isSharedActive();
+        if (running && otherApps.isNotEmpty() && sharedOut)
+        {
+            tip << tr ("\n같은 AVR로 소리를 내는 다른 앱 (공유 모드): ") << otherApps;
+        }
+        else if (running && otherApps.isNotEmpty())
         {
             statusColour = t.amber;
             statusText = tr ("다른 앱도 AVR로 출력 중: ") + otherApps + tr (" (소리가 겹쳐 들림)");

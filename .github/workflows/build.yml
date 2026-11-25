@@ -33,15 +33,28 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
+      - name: Version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path CMakeLists.txt -Pattern 'project \(AtmosBridge VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          if (-not $v) { throw "VERSION not found in CMakeLists.txt" }
+          "AB_VER=$v" >> $env:GITHUB_ENV
+          Write-Host "Version $v"
+
+      # Download files (version in the name):
+      #   Atmos-Bridge-Host-v<ver>-Install-win64.exe   installer (Start menu / desktop shortcuts, uninstall in Settings > Apps)
+      #   Atmos-Bridge-Host-v<ver>-Portable-win64.zip  unzip anywhere and run
+      #   Atmos-Bridge-7.1.4ch-v<ver>-VST3-win64.zip   the VST3 plugin
       - name: Package
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force out | Out-Null
           $src = "build/AtmosBridge_artefacts/Release/VST3/Atmos Bridge 7.1.4ch.vst3"
           if (-not (Test-Path $src)) { Get-ChildItem -Recurse build/AtmosBridge_artefacts | Select-Object FullName; throw "VST3 bundle not found" }
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item -Recurse $src "dist/Atmos Bridge 7.1.4ch.vst3"
           Copy-Item README.md dist/README.md
-          Compress-Archive -Path dist/* -DestinationPath Atmos-Bridge-7.1.4ch-VST3-win64.zip -Force
+          Compress-Archive -Path dist/* -DestinationPath "out/Atmos-Bridge-7.1.4ch-v$($env:AB_VER)-VST3-win64.zip" -Force
           Get-ChildItem -Recurse dist | Select-Object FullName, Length
 
           $exe = "build/AtmosBridgeHost_artefacts/Release/Atmos Bridge Host.exe"
@@ -49,7 +62,7 @@ jobs:
           New-Item -ItemType Directory -Force dist-host | Out-Null
           Copy-Item $exe "dist-host/Atmos Bridge Host.exe"
           Copy-Item README.md dist-host/README.md
-          Compress-Archive -Path dist-host/* -DestinationPath Atmos-Bridge-Host-win64.zip -Force
+          Compress-Archive -Path dist-host/* -DestinationPath "out/Atmos-Bridge-Host-v$($env:AB_VER)-Portable-win64.zip" -Force
           Get-ChildItem -Recurse dist-host | Select-Object FullName, Length
 
       - name: Installer
@@ -62,25 +75,14 @@ jobs:
           }
           if (-not $iscc) { throw "Inno Setup (ISCC.exe) not found" }
           Write-Host "Using $($iscc.FullName)"
-          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project \(AtmosBridge VERSION ([0-9.]+)').Matches[0].Groups[1].Value
-          & $iscc.FullName "/DAppVersion=$ver" installer/AtmosBridgeHost.iss
+          & $iscc.FullName "/DAppVersion=$($env:AB_VER)" "/FAtmos-Bridge-Host-v$($env:AB_VER)-Install-win64" installer/AtmosBridgeHost.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
-          Get-ChildItem out | Select-Object FullName, Length
+          Get-ChildItem out | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Atmos-Bridge-Host-Install-win64
-          path: out/Atmos-Bridge-Host-Install-win64.exe
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Atmos-Bridge-7.1.4ch-VST3-win64
-          path: Atmos-Bridge-7.1.4ch-VST3-win64.zip
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: Atmos-Bridge-Host-win64
-          path: Atmos-Bridge-Host-win64.zip
+          name: Atmos-Bridge-v${{ env.AB_VER }}-win64
+          path: out/*
 
       # Pushes to main publish/refresh the release for the version in CMakeLists.txt.
       - name: Publish release
@@ -89,13 +91,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          VER="v$(sed -n 's/^project (AtmosBridge VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          VER="v$AB_VER"
           echo "Release $VER"
-          NOTES="Windows x64 (build ${GITHUB_SHA::7}). Atmos-Bridge-Host-win64.zip: the standalone host app (unzip anywhere and run 'Atmos Bridge Host.exe'). Atmos-Bridge-7.1.4ch-VST3-win64.zip: the VST3 plugin (copy the 'Atmos Bridge 7.1.4ch.vst3' folder to C:\\Program Files\\Common Files\\VST3). See README for setup."
+          cat > notes.md <<EOT
+          Windows x64 (build ${GITHUB_SHA::7})
+
+          | 파일 | 무엇 |
+          |---|---|
+          | \`Atmos-Bridge-Host-$VER-Install-win64.exe\` | **Install 버전**: Atmos Bridge Host 설치 파일 (시작 메뉴 · 바탕화면 바로가기, 설정 > 앱에서 제거) |
+          | \`Atmos-Bridge-Host-$VER-Portable-win64.zip\` | **Portable 버전**: 아무 폴더에 풀고 \`Atmos Bridge Host.exe\` 실행 |
+          | \`Atmos-Bridge-7.1.4ch-$VER-VST3-win64.zip\` | **VST3 버전**: \`Atmos Bridge 7.1.4ch.vst3\` 폴더를 \`C:\\Program Files\\Common Files\\VST3\`에 복사 |
+
+          설정 방법은 README를 참고하세요.
+          EOT
           if gh release view "$VER" > /dev/null 2>&1; then
-            gh release upload "$VER" out/Atmos-Bridge-Host-Install-win64.exe Atmos-Bridge-Host-win64.zip Atmos-Bridge-7.1.4ch-VST3-win64.zip --clobber
-            gh release edit "$VER" --notes "$NOTES"
+            gh release upload "$VER" out/* --clobber
+            gh release edit "$VER" --notes-file notes.md
           else
-            gh release create "$VER" out/Atmos-Bridge-Host-Install-win64.exe Atmos-Bridge-Host-win64.zip Atmos-Bridge-7.1.4ch-VST3-win64.zip --target "$GITHUB_SHA" \
-              --title "Atmos Bridge $VER (Host app + VST3)" --notes "$NOTES"
+            gh release create "$VER" out/* --target "$GITHUB_SHA" --title "Atmos Bridge $VER (Host app + VST3)" --notes-file notes.md
           fi
