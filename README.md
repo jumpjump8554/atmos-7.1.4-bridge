@@ -14,11 +14,11 @@
 ```
 플레이어 → CABLE In (VB-Audio) → [Atmos Bridge Host: 직접 루프백 → 라우팅 → 플러그인 체인]
   → Atmos 7.1.4:  Windows 공간 음향 (Dolby Atmos for home theater, MAT) → AVR
-  → 2ch Stereo:   WASAPI 배타 모드 PCM 2.0 → AVR 업믹서 (Dolby Surround · Auro-3D · Neural:X)
+  → 2ch Stereo:   WASAPI Exclusive 모드 PCM 2.0 → AVR 업믹서 (Dolby Surround · Auro-3D · Neural:X)
 ```
 
 **설치** — `Atmos-Bridge-Host-win64.zip`을 풀어 아무 폴더(예: `C:\Atmos Bridge Host`)에 두고 `Atmos Bridge Host.exe`를 실행합니다. 설치 과정은 없습니다.
-MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰면 2ch 배타 모드가 열리지 않고, 두 번 출력될 수 있습니다).
+MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰면 2ch Exclusive 모드가 열리지 않고, 두 번 출력될 수 있습니다).
 
 **화면** — 플러그인과 같은 스피커 배치 · 채널 매핑(번호표) · 테마에 호스트 기능이 더해졌습니다.
 
@@ -42,8 +42,8 @@ MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰�
   (`%APPDATA%\Atmos Bridge Host\host-state.dat`).
 
 **2ch Stereo**
-- PCM 2.0(48 kHz 24-bit 우선)을 **배타 모드**로 AVR에 보냅니다. Windows 믹서와 공간 음향을 거치지 않으므로 AVR이 PCM을 받고 업믹서를 쓸 수 있습니다.
-- AVR 장치 속성 → 고급 → **"응용 프로그램이 이 장치를 단독으로 제어하도록 허용"**이 켜져 있어야 합니다 (꺼져 있으면 상태에 "배타 모드 꺼짐").
+- PCM 2.0(48 kHz 24-bit 우선)을 **Exclusive 모드**로 AVR에 보냅니다. Windows 믹서와 공간 음향을 거치지 않으므로 AVR이 PCM을 받고 업믹서를 쓸 수 있습니다.
+- AVR 장치 속성 → 고급 → **"응용 프로그램이 이 장치를 단독으로 제어하도록 허용"**이 켜져 있어야 합니다 (꺼져 있으면 상태에 "Exclusive 모드 꺼짐").
 - 출력하는 동안 다른 앱(알림음 등)은 AVR로 소리를 낼 수 없습니다. 다른 앱이 AVR을 쓰고 있으면 상태에 "AVR을 다른 앱이 사용 중".
 - Buffer를 줄이면 지연이 줄지만 끊김 위험이 커집니다 (AVR 드라이버의 최소 주기보다 작게는 열리지 않습니다). 기본 480 samples(10 ms)에서 시작해 끊김이 없으면 256 · 128로 줄여 보세요.
 - XTC(zBACCH 등)를 쓸 때는 AVR을 **Stereo**(또는 Direct) 모드로 두세요.

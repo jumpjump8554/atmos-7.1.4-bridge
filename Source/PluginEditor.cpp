@@ -2831,7 +2831,7 @@ public:
         }
         g.setColour (en ? (checked ? (t.dark ? t.clip : t.amber) : t.text) : t.sub);
         g.setFont (uiFont (15.0f, true));
-        g.drawText (en ? tr ("Exclusive (배타)") : tr ("Exclusive: Atmos 불가"), 36, 0, getWidth() - 40, getHeight(), juce::Justification::centredLeft, true);
+        g.drawText (en ? tr ("Exclusive") : tr ("Exclusive: Atmos 불가"), 36, 0, getWidth() - 40, getHeight(), juce::Justification::centredLeft, true);
     }
 
 private:
@@ -3392,7 +3392,7 @@ public:
 
         static const char* fmtNames[2] = { "2ch Stereo", "Atmos 7.1.4" };
         static const char* fmtTips[2] = {
-            "2ch Stereo: PCM 2.0을 배타 모드로 AVR에 보냅니다. AVR 업믹서(Dolby Surround \xc2\xb7 Auro-3D \xc2\xb7 Neural:X)를 쓰고, XTC(zBACCH 등)를 쓸 때는 AVR을 Stereo로",
+            "2ch Stereo: PCM 2.0을 Exclusive 모드로 AVR에 보냅니다. AVR 업믹서(Dolby Surround \xc2\xb7 Auro-3D \xc2\xb7 Neural:X)를 쓰고, XTC(zBACCH 등)를 쓸 때는 AVR을 Stereo로",
             "Atmos 7.1.4: 업믹서로 12채널을 만들어 Windows 공간 음향(Dolby Atmos for home theater)으로 보냅니다. 꺼져 있으면 자동으로 켜 봅니다"
         };
         for (int f = 0; f < 2; ++f)
@@ -3431,11 +3431,11 @@ public:
             bufBox.addItem (juce::String (b) + tr (" samples \xc2\xb7 ") + juce::String (b / 48.0, b % 48 == 0 ? 0 : 1) + " ms", b);
         bufBox.addItem (tr ("출력 10 ms (Windows 고정)"), 1);
         bufBox.onChange = [this] { if (bufBox.getSelectedId() > 1) proc.setExclusiveBufferFrames (bufBox.getSelectedId()); };
-        bufBox.setTooltip (tr ("2ch 배타 모드의 출력 버퍼 = 출력 지연. 작을수록 빠르지만 끊김 위험. AVR(HDMI) 드라이버의 최소 주기보다 작게는 안 됩니다."));
+        bufBox.setTooltip (tr ("2ch Exclusive 모드의 출력 버퍼 = 출력 지연. 작을수록 빠르지만 끊김 위험. AVR(HDMI) 드라이버의 최소 주기보다 작게는 안 됩니다."));
         addAndMakeVisible (bufBox);
 
-        excl.setTooltip (tr ("2ch Stereo는 배타 모드로만 출력합니다: Windows 믹서와 공간 음향을 거치지 않아야 AVR이 PCM 2.0을 받고 업믹서를 쓸 수 있습니다. "
-                             "출력 중에는 다른 앱 소리가 AVR로 나가지 않습니다. Atmos는 공간 음향 방식이라 배타 모드를 쓸 수 없습니다."));
+        excl.setTooltip (tr ("2ch Stereo는 Exclusive 모드로만 출력합니다: Windows 믹서와 공간 음향을 거치지 않아야 AVR이 PCM 2.0을 받고 업믹서를 쓸 수 있습니다. "
+                             "출력 중에는 다른 앱 소리가 AVR로 나가지 않습니다. Atmos는 공간 음향 방식이라 Exclusive 모드를 쓸 수 없습니다."));
         addAndMakeVisible (excl);
 
         outBox.setTooltip (tr ("출력 장치 (AVR). '자동'은 AVR/HDMI 장치를 우선으로 고릅니다."));
@@ -3788,15 +3788,15 @@ private:
                     if (SpatialEngine::isVirtualDeviceName (s->engine.getDeviceName()))
                     { statusColour = t.amber; statusText = tr ("가상 케이블로 출력 중: 출력 장치를 AVR로 선택하세요"); }
                     else if (s->engine.isStereoActive())
-                    { statusColour = t.ok; statusText = tr ("2ch 출력 중 \xc2\xb7 ") + name + tr (" \xc2\xb7 배타"); }
+                    { statusColour = t.ok; statusText = tr ("2ch 출력 중 \xc2\xb7 ") + name; }
                     else
                     { statusColour = t.ok; statusText = tr ("출력 중 \xc2\xb7 ") + name; }
                     break;
                 case EngineStatus::Connecting:   statusColour = t.amber; statusText = tr ("연결 중\xe2\x80\xa6"); break;
                 case EngineStatus::SpatialOff:   statusColour = t.amber; statusText = tr ("공간 음향 꺼짐: Dolby Atmos for home theater 선택 (자동으로 켜 보는 중)"); break;
                 case EngineStatus::NoDevice:     statusColour = t.red;   statusText = tr ("출력 장치 없음"); break;
-                case EngineStatus::Busy:         statusColour = t.red;   statusText = tr ("2ch: AVR을 다른 앱이 사용 중 (배타 모드 불가)"); break;
-                case EngineStatus::ExclusiveOff: statusColour = t.amber; statusText = tr ("2ch: 배타 모드 꺼짐 (소리 설정에서 허용)"); break;
+                case EngineStatus::Busy:         statusColour = t.red;   statusText = tr ("2ch: AVR을 다른 앱이 사용 중 (Exclusive 모드 불가)"); break;
+                case EngineStatus::ExclusiveOff: statusColour = t.amber; statusText = tr ("2ch: Exclusive 모드 꺼짐 (소리 설정에서 허용)"); break;
                 case EngineStatus::Error:        statusColour = t.red;   statusText = tr ("오류 (마우스를 올려 자세히 보기)"); break;
                 case EngineStatus::Unsupported:  statusColour = t.sub;   statusText = tr ("Windows 전용"); break;
                 case EngineStatus::Stopped:

@@ -156,6 +156,14 @@ public:
 
     void initialise (const juce::String& commandLine) override
     {
+        // "--quit" (used by the installer): ends a running copy (it is handed this command line, see
+        // anotherInstanceStarted); with no copy running there is nothing to do.
+        if (commandLine.contains ("--quit"))
+        {
+            quit();
+            return;
+        }
+
         FileLogger::get().setBaseName ("atmosbridge-host");
         logLine ("Atmos Bridge Host " + getApplicationVersion().toStdString() + " starting (" + commandLine.toStdString() + ")");
 
@@ -201,6 +209,7 @@ public:
 
     void shutdown() override
     {
+        if (proc == nullptr) return;   // "--quit" with nothing running: nothing was started
         stopTimer();
         saveState();
         tray.reset();
@@ -211,7 +220,16 @@ public:
     }
 
     void systemRequestedQuit() override { quit(); }
-    void anotherInstanceStarted (const juce::String&) override { showWindow(); }
+    void anotherInstanceStarted (const juce::String& commandLine) override
+    {
+        if (commandLine.contains ("--quit"))
+        {
+            logLine ("Quit requested by another process (installer)");
+            systemRequestedQuit();   // saves the state in shutdown()
+            return;
+        }
+        showWindow();
+    }
 
     //==========================================================================
     AtmosBridgeProcessor& getProcessor() noexcept { return *proc; }
@@ -320,7 +338,7 @@ void TrayIcon::update()
             case EngineStatus::Connecting:   col = juce::Colour (0xfffcee0a); state = tr ("연결 중"); break;
             case EngineStatus::SpatialOff:   col = juce::Colour (0xffff6b6b); state = tr ("공간 음향 꺼짐"); break;
             case EngineStatus::Busy:         col = juce::Colour (0xffff6b6b); state = tr ("AVR을 다른 앱이 사용 중"); break;
-            case EngineStatus::ExclusiveOff: col = juce::Colour (0xffff6b6b); state = tr ("배타 모드 꺼짐"); break;
+            case EngineStatus::ExclusiveOff: col = juce::Colour (0xffff6b6b); state = tr ("Exclusive 모드 꺼짐"); break;
             case EngineStatus::NoDevice:     col = juce::Colour (0xffff6b6b); state = tr ("출력 장치 없음"); break;
             case EngineStatus::Error:        col = juce::Colour (0xffff6b6b); state = tr ("오류"); break;
             default: break;

@@ -52,6 +52,26 @@ jobs:
           Compress-Archive -Path dist-host/* -DestinationPath Atmos-Bridge-Host-win64.zip -Force
           Get-ChildItem -Recurse dist-host | Select-Object FullName, Length
 
+      - name: Installer
+        shell: pwsh
+        run: |
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress | Out-Null
+            $iscc = Get-ChildItem "C:\Program Files*\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "Inno Setup (ISCC.exe) not found" }
+          Write-Host "Using $($iscc.FullName)"
+          $ver = (Select-String -Path CMakeLists.txt -Pattern 'project \(AtmosBridge VERSION ([0-9.]+)').Matches[0].Groups[1].Value
+          & $iscc.FullName "/DAppVersion=$ver" installer/AtmosBridgeHost.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+          Get-ChildItem out | Select-Object FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Atmos-Bridge-Host-Install-win64
+          path: out/Atmos-Bridge-Host-Install-win64.exe
+
       - uses: actions/upload-artifact@v4
         with:
           name: Atmos-Bridge-7.1.4ch-VST3-win64
@@ -73,9 +93,9 @@ jobs:
           echo "Release $VER"
           NOTES="Windows x64 (build ${GITHUB_SHA::7}). Atmos-Bridge-Host-win64.zip: the standalone host app (unzip anywhere and run 'Atmos Bridge Host.exe'). Atmos-Bridge-7.1.4ch-VST3-win64.zip: the VST3 plugin (copy the 'Atmos Bridge 7.1.4ch.vst3' folder to C:\\Program Files\\Common Files\\VST3). See README for setup."
           if gh release view "$VER" > /dev/null 2>&1; then
-            gh release upload "$VER" Atmos-Bridge-Host-win64.zip Atmos-Bridge-7.1.4ch-VST3-win64.zip --clobber
+            gh release upload "$VER" out/Atmos-Bridge-Host-Install-win64.exe Atmos-Bridge-Host-win64.zip Atmos-Bridge-7.1.4ch-VST3-win64.zip --clobber
             gh release edit "$VER" --notes "$NOTES"
           else
-            gh release create "$VER" Atmos-Bridge-Host-win64.zip Atmos-Bridge-7.1.4ch-VST3-win64.zip --target "$GITHUB_SHA" \
+            gh release create "$VER" out/Atmos-Bridge-Host-Install-win64.exe Atmos-Bridge-Host-win64.zip Atmos-Bridge-7.1.4ch-VST3-win64.zip --target "$GITHUB_SHA" \
               --title "Atmos Bridge $VER (Host app + VST3)" --notes "$NOTES"
           fi
