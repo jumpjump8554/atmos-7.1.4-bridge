@@ -2895,6 +2895,230 @@ private:
 };
 
 //==============================================================================
+// "Hide to tray" button: a window dropping into a tray.
+class TrayButton final : public juce::Button
+{
+public:
+    explicit TrayButton (const UiCtx& c) : juce::Button ("tray"), ctx (c) {}
+
+    void paintButton (juce::Graphics& g, bool over, bool down) override
+    {
+        const auto& t = ctx.th();
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        auto fill = t.btn;
+        if (down) fill = t.dark ? fill.brighter (0.15f) : fill.darker (0.08f);
+        else if (over) fill = t.dark ? fill.brighter (0.07f) : fill.darker (0.03f);
+        g.setColour (fill);
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (t.dark ? t.accent.withAlpha (0.7f) : t.btnBorder);
+        g.drawRoundedRectangle (r, 8.0f, 1.0f);
+
+        const auto ic = t.dark ? t.text : t.dim;
+        const float cx = r.getCentreX(), top = r.getY() + 8.0f;
+        juce::Path arrow;                                   // down arrow
+        arrow.startNewSubPath (cx, top);
+        arrow.lineTo (cx, top + 13.0f);
+        arrow.startNewSubPath (cx - 5.0f, top + 8.5f);
+        arrow.lineTo (cx, top + 13.5f);
+        arrow.lineTo (cx + 5.0f, top + 8.5f);
+        g.setColour (ic);
+        g.strokePath (arrow, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        juce::Path trayShape;                               // tray
+        trayShape.startNewSubPath (cx - 11.0f, top + 12.0f);
+        trayShape.lineTo (cx - 11.0f, top + 21.0f);
+        trayShape.lineTo (cx + 11.0f, top + 21.0f);
+        trayShape.lineTo (cx + 11.0f, top + 12.0f);
+        g.strokePath (trayShape, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    }
+
+private:
+    const UiCtx& ctx;
+};
+
+//==============================================================================
+// Preview of the tray icon and its right-click menu (drawn, not a live menu).
+class TrayPreview final : public juce::Component
+{
+public:
+    static constexpr int kW = 980, kH = 640;
+    explicit TrayPreview (const UiCtx& c) : ctx (c) { setSize (kW, kH); }
+
+    static void trayIcon (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour status)
+    {
+        g.setColour (C (0xff111318));
+        g.fillRoundedRectangle (r, 5.0f);
+        drawSpeakerIcon (g, r.reduced (r.getWidth() * 0.2f).translated (-1.0f, 0.0f), C (0xff39ff14), 1.6f);
+        const juce::Rectangle<float> dot (r.getRight() - 9.0f, r.getBottom() - 9.0f, 8.0f, 8.0f);
+        g.setColour (C (0xff111318));
+        g.fillEllipse (dot.expanded (1.5f));
+        g.setColour (status);
+        g.fillEllipse (dot);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& t = ctx.th();
+        g.fillAll (t.bgTop);
+        drawPanel (g, getLocalBounds().toFloat().reduced (14.0f), t);
+        drawHeading (g, t, tr ("트레이"), { 32, 26, 200, 30 }, 21.0f);
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.5f));
+        g.drawText (tr ("창을 숨겨도 소리는 계속 나갑니다 \xc2\xb7 아이콘 클릭 = 창 열기 \xc2\xb7 오른쪽 클릭 = 메뉴"), 140, 28, kW - 180, 28,
+                    juce::Justification::centredLeft, true);
+
+        // Status colours of the tray icon
+        const float lx = 40.0f;
+        float ly = 96.0f;
+        g.setColour (t.text);
+        g.setFont (uiFont (16.0f, true));
+        g.drawText (tr ("아이콘 상태 표시"), (int) lx, (int) ly, 300, 24, juce::Justification::centredLeft);
+        ly += 38.0f;
+        const std::pair<juce::Colour, const char*> states[] = {
+            { C (0xff39ff14), "출력 중" }, { C (0xfffcee0a), "연결 중 \xc2\xb7 BYPASS" },
+            { C (0xffff6b6b), "오류 (공간 음향 꺼짐 \xc2\xb7 장치 사용 중 등)" }, { C (0xff8f8bb8), "정지 \xc2\xb7 MUTE" } };
+        for (const auto& st : states)
+        {
+            trayIcon (g, { lx, ly, 32.0f, 32.0f }, st.first);
+            g.setColour (t.text);
+            g.setFont (uiFont (15.0f));
+            g.drawText (tr (st.second), (int) lx + 46, (int) ly, 340, 32, juce::Justification::centredLeft);
+            ly += 46.0f;
+        }
+        ly += 6.0f;
+        g.setColour (t.text);
+        g.setFont (uiFont (16.0f, true));
+        g.drawText (tr ("아이콘에 마우스를 올리면"), (int) lx, (int) ly, 300, 24, juce::Justification::centredLeft);
+        ly += 32.0f;
+        const juce::Rectangle<float> tip (lx, ly, 330.0f, 50.0f);
+        g.setColour (C (0xff2b2b2b));
+        g.fillRoundedRectangle (tip, 6.0f);
+        g.setColour (C (0xff4a4a4a));
+        g.drawRoundedRectangle (tip.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (juce::Colours::white);
+        g.setFont (uiFont (14.0f));
+        g.drawText (tr ("Atmos Bridge \xc2\xb7 출력 중"), tip.withHeight (25.0f).translated (12.0f, 3.0f).toNearestInt(), juce::Justification::centredLeft);
+        g.drawText (stereoText() + tr (" \xc2\xb7 지연 \xe2\x89\x88 ") + (ctx.stereoOnly ? juce::String ("30.7") : juce::String ("115.6")) + " ms",
+                    tip.withTrimmedTop (23.0f).translated (12.0f, -2.0f).toNearestInt(), juce::Justification::centredLeft);
+
+        // Taskbar strip with the tray area
+        const juce::Rectangle<float> bar (14.5f, (float) kH - 74.0f, (float) kW - 29.0f, 52.0f);
+        g.setColour (C (0xff1c1c1e));
+        g.fillRect (bar);
+        g.setColour (C (0xff2e2e32));
+        g.fillRect (bar.withHeight (1.0f));
+        const float iy = bar.getCentreY() - 12.0f;
+        float ix = bar.getRight() - 300.0f;
+        g.setColour (C (0xffcfcfcf));
+        juce::Path chev;                                   // ^ (hidden icons)
+        chev.startNewSubPath (ix, iy + 15.0f); chev.lineTo (ix + 6.0f, iy + 9.0f); chev.lineTo (ix + 12.0f, iy + 15.0f);
+        g.strokePath (chev, juce::PathStrokeType (1.6f));
+        ix += 34.0f;
+        const juce::Rectangle<float> ours (ix - 6.0f, iy - 6.0f, 36.0f, 36.0f);
+        g.setColour (C (0xff3a3a3e));
+        g.fillRoundedRectangle (ours, 5.0f);
+        trayIcon (g, ours.reduced (4.0f), C (0xff39ff14));
+        ix += 46.0f;
+        for (int k = 0; k < 2; ++k)                        // two generic icons
+        {
+            g.setColour (C (0xffcfcfcf));
+            g.drawRoundedRectangle (ix, iy + 3.0f, 18.0f, 18.0f, 4.0f, 1.4f);
+            ix += 34.0f;
+        }
+        g.setColour (C (0xffe6e6e6));
+        g.setFont (uiFont (13.5f));
+        g.drawText (tr ("오전 1:50"), (int) ix + 6, (int) bar.getY() + 6, 90, 20, juce::Justification::centred);
+        g.drawText ("2026-11-26", (int) ix + 6, (int) bar.getY() + 26, 90, 20, juce::Justification::centred);
+
+        // Right-click menu above our icon
+        paintMenu (g, t, { ours.getCentreX() - 300.0f, bar.getY() - 10.0f - 432.0f, 360.0f, 432.0f });
+    }
+
+private:
+    juce::String stereoText() const { return ctx.stereoOnly ? tr ("2ch Stereo") : tr ("Atmos 7.1.4"); }
+
+    void paintMenu (juce::Graphics& g, const Theme& t, juce::Rectangle<float> m)
+    {
+        juce::DropShadow (juce::Colours::black.withAlpha (0.5f), 16, { 0, 4 }).drawForRectangle (g, m.toNearestInt());
+        g.setColour (t.panel);
+        g.fillRoundedRectangle (m, 8.0f);
+        g.setColour (t.panelBorder);
+        g.drawRoundedRectangle (m.reduced (0.5f), 8.0f, 1.0f);
+
+        float y = m.getY() + 12.0f;
+        const float x = m.getX() + 16.0f, w = m.getWidth() - 32.0f;
+        g.setColour (t.text);
+        g.setFont (uiFont (16.0f, true));
+        g.drawText ("Atmos Bridge 7.1.4ch", (int) x, (int) y, (int) w, 22, juce::Justification::centredLeft);
+        y += 22.0f;
+        g.setColour (t.ok);
+        g.fillEllipse (x, y + 7.0f, 7.0f, 7.0f);
+        g.setColour (t.sub);
+        g.setFont (uiFont (13.5f));
+        g.drawText (tr ("출력 중 \xc2\xb7 ") + stereoText(), (int) x + 14, (int) y, (int) w - 14, 20, juce::Justification::centredLeft);
+        y += 28.0f;
+
+        auto sep = [&] { g.setColour (t.divider); g.fillRect (m.getX() + 8.0f, y + 4.0f, m.getWidth() - 16.0f, 1.0f); y += 9.0f; };
+        auto item = [&] (const juce::String& text, int mark, bool highlight = false, const juce::String& right = {})
+        {
+            // mark: 0 none, 1 check, 2 radio on, 3 radio off
+            const juce::Rectangle<float> row (m.getX() + 4.0f, y, m.getWidth() - 8.0f, 30.0f);
+            if (highlight)
+            {
+                g.setColour (t.solidActive ? t.accent.withAlpha (0.22f) : t.neon.withAlpha (0.18f));
+                g.fillRoundedRectangle (row, 5.0f);
+            }
+            const float mx = x + 6.0f, my = row.getCentreY();
+            g.setColour (t.dark ? t.neon : t.accent);
+            if (mark == 1)
+            {
+                juce::Path tick;
+                tick.startNewSubPath (mx - 4.0f, my);
+                tick.lineTo (mx - 0.5f, my + 4.0f);
+                tick.lineTo (mx + 6.0f, my - 4.5f);
+                g.strokePath (tick, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            }
+            else if (mark == 2) g.fillEllipse (mx - 4.0f, my - 4.0f, 8.0f, 8.0f);
+            else if (mark == 3) { g.setColour (t.sub); g.drawEllipse (mx - 4.0f, my - 4.0f, 8.0f, 8.0f, 1.2f); }
+            g.setColour (t.text);
+            g.setFont (uiFont (15.0f));
+            g.drawText (text, (int) x + 22, (int) y, (int) w - 22, 30, juce::Justification::centredLeft);
+            if (right.isNotEmpty())
+            {
+                g.setColour (t.sub);
+                g.setFont (uiFont (13.5f));
+                g.drawText (right, (int) x, (int) y, (int) w, 30, juce::Justification::centredRight);
+            }
+            y += 30.0f;
+        };
+        auto label = [&] (const juce::String& text)
+        {
+            g.setColour (t.sub);
+            g.setFont (uiFont (13.0f, true));
+            g.drawText (text, (int) x, (int) y + 4, (int) w, 18, juce::Justification::centredLeft);
+            y += 22.0f;
+        };
+
+        item (tr ("창 열기"), 0, true, tr ("아이콘 클릭"));
+        sep();
+        label (tr ("출력 형식"));
+        item (tr ("Atmos 7.1.4"), ctx.stereoOnly ? 3 : 2);
+        item (tr ("2ch Stereo"), ctx.stereoOnly ? 2 : 3);
+        item (tr ("모드"), 0, false, tr ("저지연  \xe2\x96\xb8"));
+        sep();
+        item ("BYPASS", 0);
+        item ("MUTE", 0);
+        sep();
+        item (tr ("최소화하면 트레이로"), 1);
+        item (tr ("닫기(X)도 트레이로 (종료는 이 메뉴)"), 1);
+        item (tr ("Windows 시작 시 트레이로 자동 실행"), 1);
+        sep();
+        item (tr ("종료"), 0);
+    }
+
+    const UiCtx& ctx;
+};
+
+//==============================================================================
 // Static background of the host window.
 class HostBackground final : public juce::Component
 {
@@ -3030,6 +3254,10 @@ public:
         routingBtn.onClick = [this] { openRouting(); };
         addAndMakeVisible (routingBtn);
 
+        trayBtn.setTooltip (tr ("트레이로 숨기기: 창은 사라지고 소리는 계속 나갑니다. 작업 표시줄 트레이 아이콘을 누르면 다시 열림 "
+                                "(오른쪽 클릭 = 출력 형식 \xc2\xb7 BYPASS \xc2\xb7 MUTE \xc2\xb7 종료)"));
+        addAndMakeVisible (trayBtn);
+
         seqBtn.onClick = [this] { proc.toggleSequence(); };
         addAndMakeVisible (seqBtn);
         stopBtn.setButtonText (tr ("테스트 정지"));
@@ -3088,6 +3316,7 @@ public:
         master.setColour (juce::Slider::trackColourId, t.dark ? t.neon.withAlpha (0.8f) : t.accent);
         master.setColour (juce::Slider::thumbColourId, t.dark ? t.neon : t.accent);
         excl.repaint();
+        trayBtn.repaint();
         if (routingView != nullptr) { routingView->style(); routingView->repaint(); }
 
         background.repaint();
@@ -3111,7 +3340,8 @@ public:
         bufBox.setBounds (628, 117, 214, 32);
         excl.setBounds (852, 117, 184, 32);
         outBox.setBounds (1060, 117, 438, 32);
-        routingBtn.setBounds (1524, 111, 180, 40);
+        routingBtn.setBounds (1524, 111, 124, 40);
+        trayBtn.setBounds (1656, 111, 48, 40);
         room.setBounds (kHRoom);
         map.setBounds (kHMap);
         right.setBounds (kHRight);
@@ -3286,6 +3516,7 @@ private:
     std::array<juce::TextButton, kNumModes> modeBtn;
     std::array<juce::TextButton, 2> fmtBtn;
     juce::TextButton routingBtn, seqBtn, stopBtn, muteBtn;
+    TrayButton trayBtn { ctx };
     juce::Slider master;
     ScanlineOverlay scanlines;
     std::unique_ptr<juce::DocumentWindow> routingWin;
@@ -3297,6 +3528,16 @@ private:
 };
 
 #if AB_TEST_HOOKS
+juce::Image abtest::renderTray (int theme, bool stereo)
+{
+    UiCtx ctx;
+    ctx.t = &themeFor ((ThemeId) theme);
+    ctx.stereoOnly = stereo;
+    TrayPreview v (ctx);
+    v.setBounds (0, 0, TrayPreview::kW, TrayPreview::kH);
+    return v.createComponentSnapshot (v.getLocalBounds(), true, 1.0f);
+}
+
 juce::Image abtest::renderRouting (int theme, bool stereo)
 {
     UiCtx ctx;

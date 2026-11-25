@@ -10,6 +10,7 @@ namespace abtest
     juce::Component* findRoom (juce::Component* editor);
     void roomTick (juce::Component* editor, double dtSec);
     juce::Image renderRouting (int theme, bool stereo);   // host app preview: the Routing window
+    juce::Image renderTray (int theme, bool stereo);      // host app preview: tray icon + menu
 }
 #endif
 
