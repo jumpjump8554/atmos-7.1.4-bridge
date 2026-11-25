@@ -163,6 +163,7 @@ public:
     ab::OutputFormat getOutputFormat() const noexcept { return (ab::OutputFormat) outputFormat.load(); }
     void setOutputFormat (ab::OutputFormat f);
     int getExclusiveBufferFrames() const noexcept { return exclusiveFrames; }   // 2ch exclusive buffer at 48 kHz
+    static constexpr std::array<int, 5> kExclusiveBuffers { 128, 256, 480, 512, 1024 };
     void setExclusiveBufferFrames (int frames);
 
     float getMasterDb() const noexcept { return masterDb.load(); }
@@ -199,7 +200,7 @@ public:
     void removeChainItem (int pos);
     void moveChainItem (int from, int to);
     void toggleChainBypass (int pos);
-    void toggleChainActive (int pos);                // upmixers: O / X
+    void toggleChainActive (int pos);                // O / X (upmixers: only one is on)
     void cycleChainScope (int pos);                  // stereo plugins: both / 2ch only / Atmos only
     juce::AudioPluginInstance* getChainInstance (int pos) const noexcept;
     int getChainWindowKey (int pos) const noexcept;  // stable key per hosted plugin (0..3 upmixers, 4..7 stereo)
@@ -315,6 +316,7 @@ private:
         int host = -1;
         juce::String path, name, pendingState, error;
         bool bypass = false;
+        bool on = true;             // O / X
         int scope = 0;
     };
     struct ChainRef { bool upmixer = false; int host = -1; };
@@ -329,7 +331,7 @@ private:
 
     bool hostApp = false;
     std::atomic<int> outputFormat { 0 };
-    int exclusiveFrames = 240;
+    int exclusiveFrames = 480;
     std::atomic<float> masterDb { 0.0f };
     std::atomic<bool> masterMute { false };
     float masterNow = 1.0f;

@@ -2454,8 +2454,10 @@ public:
         scopeBtn.setColour (juce::TextButton::buttonColourId, t.btn);
         scopeBtn.setColour (juce::TextButton::textColourOffId, special ? (t.dark ? t.accent : t.text) : t.dim);
         setBorder (scopeBtn, special ? (t.dark ? t.accent.withAlpha (0.7f) : t.dim) : t.btnBorder);
-        onBtn.setVisible (d.upmixer);
+        onBtn.setVisible (true);
         onBtn.setEnabled (d.loaded);
+        onBtn.setTooltip (d.upmixer ? tr ("O = 켜짐 / X = 꺼짐 (켜진 업믹서는 하나뿐)")
+                                    : tr ("O = 켜짐 / X = 꺼짐 (꺼진 플러그인은 처리하지 않고 지연에서도 빠짐)"));
         onBtn.setButtonText (d.active ? "O" : "X");
         styleToggle (onBtn, t, d.active);
         bypBtn.setEnabled (d.loaded);
@@ -2475,7 +2477,7 @@ public:
         delBtn.setBounds (getWidth() - 36, y, 28, 28);
         bypBtn.setBounds (getWidth() - 68, y, 28, 28);
         onBtn.setBounds (getWidth() - 100, y, 28, 28);
-        scopeBtn.setBounds (getWidth() - (data.upmixer ? 192 : 160), y, 86, 28);
+        scopeBtn.setBounds (getWidth() - 192, y, 86, 28);
     }
 
     void paint (juce::Graphics& g) override
@@ -2497,7 +2499,7 @@ public:
         g.drawText (juce::String (idx + 1), 30, 0, 16, getHeight(), juce::Justification::centred);
 
         const int top = (getHeight() - 38) / 2;
-        const int textW = getWidth() - (data.upmixer ? 252 : 220);
+        const int textW = getWidth() - 252;
         g.setColour (t.text.withMultipliedAlpha (a));
         g.setFont (uiFont (15.5f, true));
         g.drawText (data.name, 52, top, textW, 20, juce::Justification::centredLeft, true);
@@ -2508,6 +2510,7 @@ public:
         if (! data.loaded)                        { info = data.error.isNotEmpty() ? data.error : tr ("불러오지 못함"); infoCol = t.clip; }
         else if (data.bypass)                     { info = tr ("바이패스"); infoCol = t.bypFg; }
         else if (data.upmixer && ! data.active)   info = tr ("꺼짐 (켜진 업믹서는 하나)");
+        else if (! data.active)                   info = tr ("꺼짐");
         else if (data.upmixer && data.idle)       info = tr ("Atmos 전용 \xc2\xb7 2ch에서 쉼");
         else if (data.idle)                       info = data.scope == 1 ? tr ("2ch 전용 \xc2\xb7 Atmos에서 쉼") : tr ("Atmos 전용 \xc2\xb7 2ch에서 쉼");
         else if (data.upmixer)                    info = tr ("업믹서 2 \xe2\x86\x92 12ch \xc2\xb7 ") + lat;
@@ -2520,7 +2523,7 @@ public:
     void mouseMove (const juce::MouseEvent& e) override
     {
         setMouseCursor (e.x < 46 ? juce::MouseCursor::UpDownResizeCursor
-                                 : e.x < getWidth() - (data.upmixer ? 196 : 164) ? juce::MouseCursor::PointingHandCursor
+                                 : e.x < getWidth() - 196 ? juce::MouseCursor::PointingHandCursor
                                                                                   : juce::MouseCursor::NormalCursor);
     }
 
@@ -2544,7 +2547,7 @@ public:
             if (onDrag) onDrag (e.getDistanceFromDragStartY(), true);
             return;
         }
-        if (e.mouseWasClicked() && e.x < getWidth() - (data.upmixer ? 196 : 164) && data.loaded && onOpen) onOpen();
+        if (e.mouseWasClicked() && e.x < getWidth() - 196 && data.loaded && onOpen) onOpen();
     }
 
     juce::TextButton scopeBtn, onBtn, bypBtn, delBtn;
@@ -3424,9 +3427,8 @@ public:
         fillInputs();
         addAndMakeVisible (inBox);
 
-        const int bufs[4] = { 96, 144, 240, 480 };
-        for (int k = 0; k < 4; ++k)
-            bufBox.addItem (tr ("버퍼 ") + juce::String (bufs[k]) + tr (" smp \xc2\xb7 ") + juce::String (bufs[k] / 48.0, bufs[k] % 48 == 0 ? 0 : 1) + " ms", bufs[k]);
+        for (const int b : AtmosBridgeProcessor::kExclusiveBuffers)
+            bufBox.addItem (juce::String (b) + tr (" samples \xc2\xb7 ") + juce::String (b / 48.0, b % 48 == 0 ? 0 : 1) + " ms", b);
         bufBox.addItem (tr ("출력 10 ms (Windows 고정)"), 1);
         bufBox.onChange = [this] { if (bufBox.getSelectedId() > 1) proc.setExclusiveBufferFrames (bufBox.getSelectedId()); };
         bufBox.setTooltip (tr ("2ch 배타 모드의 출력 버퍼 = 출력 지연. 작을수록 빠르지만 끊김 위험. AVR(HDMI) 드라이버의 최소 주기보다 작게는 안 됩니다."));
@@ -3592,8 +3594,6 @@ public:
             lastStereo = st;
             segment (fmtBtn[0], stereo);
             segment (fmtBtn[1], ! stereo);
-            if (stereo && bufBox.indexOfItemId (proc.getExclusiveBufferFrames()) < 0)
-                bufBox.addItem (tr ("버퍼 ") + juce::String (proc.getExclusiveBufferFrames()) + " smp", proc.getExclusiveBufferFrames());
             bufBox.setSelectedId (stereo ? proc.getExclusiveBufferFrames() : 1, juce::dontSendNotification);
             bufBox.setEnabled (stereo);
             excl.checked = stereo;

@@ -1345,7 +1345,8 @@ void AtmosBridgeProcessor::setOutputFormat (OutputFormat f)
 
 void AtmosBridgeProcessor::setExclusiveBufferFrames (int frames)
 {
-    exclusiveFrames = juce::jlimit (32, 4800, frames);
+    // Only the offered sizes (others, e.g. from an older state, become 480)
+    exclusiveFrames = std::find (kExclusiveBuffers.begin(), kExclusiveBuffers.end(), frames) != kExclusiveBuffers.end() ? frames : 480;
     if (auto* s = getSharedOutput()) s->engine.setExclusiveBufferFrames (exclusiveFrames);
     writeExtrasToState();
     stateChanged();
@@ -1496,7 +1497,7 @@ void AtmosBridgeProcessor::rebuildChainSeq()
         const int i = fxIndexForHost (r.host);
         if (i < 0) continue;
         const auto& e = fxList[(size_t) i];
-        if (e.bypass || ! fxHosts[(size_t) e.host]->getInfo().loaded) continue;
+        if (! e.on || e.bypass || ! fxHosts[(size_t) e.host]->getInfo().loaded) continue;
         if ((stereo && e.scope == 2) || (! stereo && e.scope == 1)) continue;
         seq[(size_t) k++] = r.host;
     }
@@ -1541,10 +1542,11 @@ AtmosBridgeProcessor::ChainView AtmosBridgeProcessor::getChainItem (int pos) con
     v.path = e.path;
     v.error = info.loaded ? juce::String() : (e.error.isNotEmpty() ? e.error : info.error);
     v.bypass = e.bypass;
+    v.active = e.on;
     v.scope = e.scope;
     v.latencyMs = info.loaded ? 1000.0 * info.latencySamples / juce::jmax (1.0, currentSampleRate) : 0.0;
     v.afterUpmixer = afterUp && ! stereo;
-    v.idle = (stereo && e.scope == 2) || (! stereo && e.scope == 1);
+    v.idle = ! e.on || (stereo && e.scope == 2) || (! stereo && e.scope == 1);
     return v;
 }
 
@@ -1634,8 +1636,18 @@ void AtmosBridgeProcessor::toggleChainBypass (int pos)
 
 void AtmosBridgeProcessor::toggleChainActive (int pos)
 {
-    if (pos < 0 || pos >= (int) chain.size() || ! chain[(size_t) pos].upmixer) return;
-    toggleSlotActive (slotIndexForHost (chain[(size_t) pos].host));
+    if (pos < 0 || pos >= (int) chain.size()) return;
+    const auto r = chain[(size_t) pos];
+    if (r.upmixer) { toggleSlotActive (slotIndexForHost (r.host)); return; }
+    const int i = fxIndexForHost (r.host);
+    if (i < 0) return;
+    auto& e = fxList[(size_t) i];
+    e.on = ! e.on;
+    if (e.on) fxHosts[(size_t) e.host]->resetPlugin();   // still out of the audio path here
+    rebuildChainSeq();
+    writeExtrasToState();
+    stateChanged();
+    logLine ("Stereo plugin " + e.name.toStdString() + (e.on ? ": on" : ": off"));
 }
 
 void AtmosBridgeProcessor::cycleChainScope (int pos)
@@ -1736,6 +1748,7 @@ void AtmosBridgeProcessor::writeHostState (juce::ValueTree& s)
             t.setProperty ("path", e.path, nullptr);
             t.setProperty ("name", e.name, nullptr);
             t.setProperty ("bypass", e.bypass, nullptr);
+            t.setProperty ("on", e.on, nullptr);
             t.setProperty ("scope", e.scope, nullptr);
             hc.appendChild (t, nullptr);
         }
@@ -1749,6 +1762,7 @@ void AtmosBridgeProcessor::writeHostState (juce::ValueTree& s)
             t.setProperty ("path", e.path, nullptr);
             t.setProperty ("name", e.name, nullptr);
             t.setProperty ("bypass", e.bypass, nullptr);
+            t.setProperty ("on", e.on, nullptr);
             t.setProperty ("scope", e.scope, nullptr);
             hc.appendChild (t, nullptr);
         }
@@ -1770,7 +1784,10 @@ void AtmosBridgeProcessor::readHostState (const juce::ValueTree& s)
     if (! hc.isValid()) return;   // plugin project, or a new host app
 
     outputFormat.store (juce::jlimit (0, 1, (int) s.getProperty ("hostFormat", 0)));
-    exclusiveFrames = juce::jlimit (32, 4800, (int) s.getProperty ("exclusiveFrames", 240));
+    {
+        const int f = (int) s.getProperty ("exclusiveFrames", 480);
+        exclusiveFrames = std::find (kExclusiveBuffers.begin(), kExclusiveBuffers.end(), f) != kExclusiveBuffers.end() ? f : 480;
+    }
     masterDb.store (juce::jlimit (-60.0f, 0.0f, (float) (double) s.getProperty ("masterDb", 0.0)));
     masterMute.store ((bool) s.getProperty ("masterMute", false));
     if (auto* sh = getSharedOutput())
@@ -1804,6 +1821,7 @@ void AtmosBridgeProcessor::readHostState (const juce::ValueTree& s)
         e.name = t.getProperty ("name", "").toString();
         e.pendingState = t.getProperty ("state", "").toString();
         e.bypass = (bool) t.getProperty ("bypass", false);
+        e.on = (bool) t.getProperty ("on", true);
         e.scope = juce::jlimit (0, 2, (int) t.getProperty ("scope", 0));
         if (e.path.isNotEmpty()) pf.fx.push_back (e);
     }
