@@ -64,6 +64,15 @@ public:
     int getPosition (int input) const noexcept { return outMap[(size_t) input].load(); }
     void setPosition (int input, int position);
     void resetMapping();
+
+    // Channel order presets for the number table: what order the input channels (an upmixer's outputs without
+    // speaker names, or a multichannel source) come in.
+    //   Windows (WAVEFORMATEXTENSIBLE): L R C LFE BL BR SL SR TFL TFR TBL TBR   = the positions as they are
+    //   Dolby / ITU-R BS.2051 7.1.4:    L R C LFE Lss Rss Lrs Rrs Ltf Rtf Ltb Rtb (sides before rears)
+    //   Auro-3D 11.1 (7.1 + 4H):        L R C LFE Lb Rb Ls Rs HL HR HLs HRs     (same as Windows)
+    enum MapPreset { kMapWindows = 0, kMapDolby = 1, kMapAuro = 2 };
+    void applyMapPreset (int preset);
+    int getMapPreset() const noexcept;     // the preset the table matches, -1 = custom
     bool isDuplicatePosition (int position) const noexcept;
 
     bool isMuted (int input) const noexcept { return muteParams[(size_t) input]->load() > 0.5f; }
@@ -254,6 +263,8 @@ private:
     Map liveMap() const noexcept;
     void applyLiveMap (const Map& m) noexcept;
     Map& activeMapMemory() noexcept;               // the table that belongs to the current choice
+    static Map presetMap (int preset) noexcept;
+    int mapPresetChosen = kMapWindows;
     void setActiveSlot (int index);
     void unloadAllSlots();
     int findFreeHost() const noexcept;

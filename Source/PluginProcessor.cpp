@@ -794,14 +794,43 @@ void AtmosBridgeProcessor::setPosition (int input, int position)
     outMap[(size_t) input].store (p);
     activeMapMemory()[(size_t) input] = p;
     writeExtrasToState();
+    stateChanged();
 }
 
 void AtmosBridgeProcessor::resetMapping()
 {
-    activeMapMemory() = defaultMap();
-    applyLiveMap (defaultMap());
+    applyMapPreset (kMapWindows);
+}
+
+AtmosBridgeProcessor::Map AtmosBridgeProcessor::presetMap (int preset) noexcept
+{
+    Map m = defaultMap();
+    if (preset == kMapDolby)
+    {
+        m[4] = 6; m[5] = 7;   // Lss / Rss (inputs 5, 6) -> SL / SR
+        m[6] = 4; m[7] = 5;   // Lrs / Rrs (inputs 7, 8) -> SBL / SBR
+    }
+    return m;
+}
+
+void AtmosBridgeProcessor::applyMapPreset (int preset)
+{
+    preset = juce::jlimit (0, 2, preset);
+    mapPresetChosen = preset;
+    activeMapMemory() = presetMap (preset);
+    applyLiveMap (presetMap (preset));
     writeExtrasToState();
-    logLine ("Mapping reset to default");
+    stateChanged();
+    logLine ("Channel order preset: " + std::string (preset == kMapDolby ? "Dolby" : preset == kMapAuro ? "Auro-3D" : "Windows"));
+}
+
+int AtmosBridgeProcessor::getMapPreset() const noexcept
+{
+    const auto live = liveMap();
+    if (live == presetMap (mapPresetChosen)) return mapPresetChosen;
+    if (live == presetMap (kMapWindows)) return kMapWindows;
+    if (live == presetMap (kMapDolby)) return kMapDolby;
+    return -1;
 }
 
 bool AtmosBridgeProcessor::isDuplicatePosition (int position) const noexcept
@@ -858,6 +887,7 @@ void AtmosBridgeProcessor::stopTests()
 
 void AtmosBridgeProcessor::setMode (LatencyMode m)
 {
+    if (hostApp && m == LatencyMode::Ultra) m = LatencyMode::Low;   // the host app has Default and Low only
     setParam ("mode", (float) (int) m);
     logLine ("Latency mode: " + std::to_string ((int) m));
 }
@@ -1163,6 +1193,7 @@ void AtmosBridgeProcessor::writeExtrasToState()
     s.setProperty ("uiScale", uiScale, nullptr);
     s.setProperty ("theme", (int) theme, nullptr);
     s.setProperty ("directSource", directSourceId, nullptr);
+    s.setProperty ("mapPreset", mapPresetChosen, nullptr);
     s.setProperty ("stateVersion", 3, nullptr);
 
     // While a restore is still pending, the slots that are about to be loaded are what we save.
@@ -1196,6 +1227,7 @@ void AtmosBridgeProcessor::readExtrasFromState()
     applyLiveMap (live);
 
     uiScale = juce::jlimit (0.5f, 1.5f, (float) s.getProperty ("uiScale", uiScale));
+    mapPresetChosen = juce::jlimit (0, 2, (int) s.getProperty ("mapPreset", (int) kMapWindows));
     directSourceId = s.getProperty ("directSource", "").toString();
 
     // Theme: the one last chosen on this PC wins; the project's own value is used when there is none.
@@ -1312,6 +1344,7 @@ void AtmosBridgeProcessor::setHostApp (bool on)
         s->engine.setStereo (on && getOutputFormat() == OutputFormat::Stereo);
     }
     writeExtrasToState();
+    if (on && getMode() == LatencyMode::Ultra) setMode (LatencyMode::Low);
     logLine (on ? "Running as the host app (Atmos Bridge Host)" : "Running as a plugin");
 }
 
@@ -1784,6 +1817,7 @@ void AtmosBridgeProcessor::readHostState (const juce::ValueTree& s)
     if (! hc.isValid()) return;   // plugin project, or a new host app
 
     outputFormat.store (juce::jlimit (0, 1, (int) s.getProperty ("hostFormat", 0)));
+    if (hostApp && getMode() == LatencyMode::Ultra) setMode (LatencyMode::Low);   // saved by an older version
     {
         const int f = (int) s.getProperty ("exclusiveFrames", 480);
         exclusiveFrames = std::find (kExclusiveBuffers.begin(), kExclusiveBuffers.end(), f) != kExclusiveBuffers.end() ? f : 480;

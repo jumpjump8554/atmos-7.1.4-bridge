@@ -358,8 +358,7 @@ void TrayIcon::showMenu()
 
     juce::PopupMenu modes;
     modes.addItem (20, tr ("기본"), true, mode == 0);
-    modes.addItem (21, tr ("저지연"), true, mode == 1);
-    modes.addItem (22, tr ("초저지연+"), true, mode == 2);
+    modes.addItem (21, tr ("저지연"), true, mode >= 1);
 
     juce::PopupMenu m;
     m.addSectionHeader ("Atmos Bridge Host " + juce::JUCEApplication::getInstance()->getApplicationVersion());
@@ -388,7 +387,7 @@ void TrayIcon::showMenu()
             case 1:  app.showWindow(); break;
             case 10: pr.setOutputFormat (OutputFormat::Atmos); break;
             case 11: pr.setOutputFormat (OutputFormat::Stereo); break;
-            case 20: case 21: case 22: pr.setMode ((LatencyMode) (r - 20)); break;
+            case 20: case 21: pr.setMode ((LatencyMode) (r - 20)); break;
             case 30: pr.setBypassed (! pr.isBypassed()); break;
             case 31: pr.setMasterMuted (! pr.isMasterMuted()); break;
             case 40: app.setOption ("minimiseToTray", ! app.getOption ("minimiseToTray")); break;

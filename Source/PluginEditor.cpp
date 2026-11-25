@@ -1172,10 +1172,17 @@ public:
             addAndMakeVisible (mb);
         }
 
-        resetBtn.setButtonText (tr ("기본값"));
-        resetBtn.setTooltip (tr ("지금 쓰는 번호표를 기본 순서(1~12)로 되돌립니다"));
-        resetBtn.onClick = [this] { proc.resetMapping(); };
-        addAndMakeVisible (resetBtn);
+        orderBox.addItem ("Windows", 1);
+        orderBox.addItem ("Dolby", 2);
+        orderBox.addItem ("Auro-3D", 3);
+        orderBox.setTextWhenNothingSelected (tr ("사용자 지정"));
+        orderBox.setTooltip (tr ("입력 채널 순서 (번호표를 그 순서에 맞게 한 번에 설정)\n"
+                                 "Windows: L R C LFE SBL SBR SL SR TFL TFR TRL TRR (기본, 다채널 소스는 이 순서로 들어옴)\n"
+                                 "Dolby: L R C LFE Lss Rss Lrs Rrs Ltf Rtf Ltb Rtb (사이드가 리어보다 먼저)\n"
+                                 "Auro-3D 11.1 (7.1+4H): L R C LFE Lb Rb Ls Rs HL HR HLs HRs (Windows와 같은 순서)\n"
+                                 "업믹서가 '채널 순서 자동'이면 Windows로 두세요."));
+        orderBox.onChange = [this] { if (const int id = orderBox.getSelectedId(); id > 0) proc.applyMapPreset (id - 1); };
+        addAndMakeVisible (orderBox);
 
         allMuteBtn.onClick = [this] { proc.setAllMuted (! proc.areAllMuted()); };
         addAndMakeVisible (allMuteBtn);
@@ -1183,7 +1190,7 @@ public:
 
     void resized() override
     {
-        resetBtn.setBounds (254, 18, 64, 30);
+        orderBox.setBounds (206, 18, 112, 30);
         allMuteBtn.setBounds (326, 18, 96, 30);
         for (int i = 0; i < kNumChannels; ++i)
         {
@@ -1220,6 +1227,16 @@ public:
             setBorder (mb, muted ? t.muteBorder : t.btnBorder);
         }
 
+        if (! orderBox.isPopupActive())
+        {
+            const int preset = proc.getMapPreset();
+            if (orderBox.getSelectedId() != preset + 1)
+            {
+                if (preset >= 0) orderBox.setSelectedId (preset + 1, juce::dontSendNotification);
+                else             orderBox.setSelectedId (0, juce::dontSendNotification);
+            }
+        }
+
         const bool all = proc.areAllMuted();
         allMuteBtn.setButtonText (all ? "All Unmute" : "All Mute");
         allMuteBtn.setColour (juce::TextButton::buttonColourId, all ? t.muteBg : t.btn);
@@ -1238,7 +1255,10 @@ public:
             cb.setColour (juce::ComboBox::backgroundColourId, t.field);
             cb.setColour (juce::ComboBox::textColourId, t.text);
         }
-        stylePlain (resetBtn, t);
+        orderBox.setColour (juce::ComboBox::backgroundColourId, t.field);
+        orderBox.setColour (juce::ComboBox::textColourId, t.text);
+        orderBox.setColour (juce::ComboBox::outlineColourId, t.btnBorder);
+        orderBox.setColour (juce::ComboBox::arrowColourId, t.sub);
         for (auto& nb : noiseBtn) nb->repaint();
         refresh();
     }
@@ -1342,7 +1362,8 @@ private:
     std::array<juce::ComboBox, kNumChannels> numBox;
     std::array<std::unique_ptr<NoiseButton>, kNumChannels> noiseBtn;
     std::array<juce::TextButton, kNumChannels> muteBtn;
-    juce::TextButton resetBtn, allMuteBtn;
+    juce::ComboBox orderBox;
+    juce::TextButton allMuteBtn;
     std::array<float, kNumChannels> rms {};
 };
 
@@ -3375,13 +3396,12 @@ public:
         for (int k = 0; k < kNumWindowKeys; ++k)
             proc.getHostByKey (k).beforeUnload = [this, k] { windows[(size_t) k].reset(); };
 
-        static const char* modeNames[kNumModes] = { "기본", "저지연", "초저지연+" };
-        static const char* modeTips[kNumModes] = {
+        static const char* modeNames[kHostModes] = { "기본", "저지연" };
+        static const char* modeTips[kHostModes] = {
             "기본: 여유 버퍼를 넉넉하게 (20 ms 이상, 가장 안정적)",
-            "저지연: 여유 버퍼 자동 보정 (끊김 0 우선)",
-            "초저지연+: 패킷 도착과 출력 타이밍까지 맞춰 여유를 더 줄임"
+            "저지연: 여유 버퍼 자동 보정 (끊김 0 우선)"
         };
-        for (int m = 0; m < kNumModes; ++m)
+        for (int m = 0; m < kHostModes; ++m)
         {
             auto& b = modeBtn[(size_t) m];
             b.setButtonText (tr (modeNames[m]));
@@ -3551,7 +3571,7 @@ public:
         scanlines.setBounds (getLocalBounds());
         themeBox.setBounds (520, 34, 170, 32);
         for (int f = 0; f < 2; ++f) fmtBtn[(size_t) f].setBounds (1158 + f * 155, 35, 153, 30);
-        for (int m = 0; m < kNumModes; ++m) modeBtn[(size_t) m].setBounds (1486 + m * 70, 35, 66, 30);
+        for (int m = 0; m < kHostModes; ++m) modeBtn[(size_t) m].setBounds (1486 + m * 106, 35, 104, 30);
         inBox.setBounds (40, 117, 440, 32);
         bufBox.setBounds (628, 117, 214, 32);
         excl.setBounds (852, 117, 184, 32);
@@ -3586,7 +3606,7 @@ public:
         if (mode != lastMode)
         {
             lastMode = mode;
-            for (int m = 0; m < kNumModes; ++m) segment (modeBtn[(size_t) m], m == mode);
+            for (int m = 0; m < kHostModes; ++m) segment (modeBtn[(size_t) m], m == mode);
         }
         const int st = stereo ? 1 : 0;
         if (st != lastStereo || bufBox.getSelectedId() != (stereo ? proc.getExclusiveBufferFrames() : 1))
@@ -3862,7 +3882,8 @@ private:
     DeviceBox inBox, outBox;
     juce::StringArray inIds, outIds;
     ExclusiveCheck excl;
-    std::array<juce::TextButton, kNumModes> modeBtn;
+    static constexpr int kHostModes = 2;          // Default / Low (the host app has no Ultra+)
+    std::array<juce::TextButton, kHostModes> modeBtn;
     std::array<juce::TextButton, 2> fmtBtn;
     juce::TextButton routingBtn, seqBtn, stopBtn, muteBtn;
     TrayButton trayBtn { ctx };
