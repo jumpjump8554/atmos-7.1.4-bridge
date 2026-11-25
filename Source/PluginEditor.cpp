@@ -1,4 +1,9 @@
 #include "PluginEditor.h"
+#include <cstdlib>
+
+#ifndef AB_HOST_UI
+ #define AB_HOST_UI AB_TEST_HOOKS   // host app screen: preview only for now
+#endif
 
 using namespace ab;
 
@@ -448,6 +453,7 @@ struct UiCtx
 {
     const Theme* t = &themeFor (ThemeId::Cyberpunk);
     const Theme& th() const noexcept { return *t; }
+    bool stereoOnly = false;   // host app, 2ch Stereo output: only L/R are used
 };
 
 //==============================================================================
@@ -757,6 +763,12 @@ public:
 
         const juce::Colour hot = t.dark ? juce::Colours::white : t.neon;
 
+        if (ctx.stereoOnly)
+        {
+            paintStereo (g, t, numbers);
+            return;
+        }
+
         // Ceiling beams (behind the speakers): body sets the beam, punch surges and widens it
         for (int p = 0; p < kNumChannels; ++p)
         {
@@ -792,18 +804,7 @@ public:
 
         // Floor reflections under the ear-level speakers
         for (int p = 0; p < kNumChannels; ++p)
-        {
-            const auto& s = kGeo[p];
-            if (s.top) continue;
-            const auto& n = neon[(size_t) p];
-            const float a = (t.dark ? 0.22f : 0.16f) * n.body + (t.dark ? 0.32f : 0.22f) * n.punch;
-            if (a <= 0.01f) continue;
-            const float w = s.w * 2.2f + 34.0f * n.punch, h = 16.0f + 10.0f * n.punch;
-            const float cx = s.x + s.w * 0.5f, cy = s.y + s.h + 10.0f;
-            juce::ColourGradient grad (t.neon.withAlpha (juce::jmin (1.0f, a)), cx, cy, t.neon.withAlpha (0.0f), cx + w * 0.5f, cy, true);
-            g.setGradientFill (grad);
-            g.fillEllipse (cx - w * 0.5f, cy - h * 0.5f, w, h);
-        }
+            drawReflection (g, t, p);
 
         const int seq = proc.getSequencePosition();
         const int posNoise = seq >= 0 ? seq : proc.getPositionNoise();
@@ -811,6 +812,59 @@ public:
             drawSpeaker (g, t, p, neon[(size_t) p], neon[(size_t) p].clipHold > 0.0f, p == posNoise,
                          numbers[p].isEmpty() ? tr ("\xe2\x80\x93") : numbers[p]);
 
+        paintBypass (g, t);
+    }
+
+    // 2ch Stereo (host app): only L/R play; the other speakers are drawn quiet under a veil.
+    void paintStereo (juce::Graphics& g, const Theme& t, const juce::String* numbers)
+    {
+        const Neon quiet {};
+        for (int p = 2; p < kNumChannels; ++p)
+            drawSpeaker (g, t, p, quiet, false, false, tr ("\xe2\x80\x93"));
+        g.setColour ((t.dark ? juce::Colours::black : juce::Colours::white).withAlpha (t.dark ? 0.55f : 0.62f));
+        g.fillAll();
+
+        const int seq = proc.getSequencePosition();
+        const int posNoise = seq >= 0 ? seq : proc.getPositionNoise();
+        for (int p = 0; p < 2; ++p)
+        {
+            drawReflection (g, t, p);
+            drawSpeaker (g, t, p, neon[(size_t) p], neon[(size_t) p].clipHold > 0.0f, p == posNoise,
+                         numbers[p].isEmpty() ? tr ("\xe2\x80\x93") : numbers[p]);
+        }
+
+        const juce::Rectangle<float> b (170.0f, 384.0f, 440.0f, 58.0f);
+        g.setColour (t.panel.withAlpha (0.94f));
+        g.fillRoundedRectangle (b, 10.0f);
+        g.setColour (t.dark ? t.accent.withAlpha (0.7f) : t.panelBorder);
+        g.drawRoundedRectangle (b.reduced (0.5f), 10.0f, 1.0f);
+        g.setColour (t.text);
+        g.setFont (uiFont (16.0f, true));
+        g.drawText (tr ("2ch Stereo \xc2\xb7 L / R\xeb\xa7\x8c \xec\xb6\x9c\xeb\xa0\xa5"), b.withHeight (32.0f).translated (0, 4).toNearestInt(), juce::Justification::centred);
+        g.setColour (t.sub);
+        g.setFont (uiFont (13.5f));
+        g.drawText (tr ("\xec\x97\x85\xeb\xaf\xb9\xec\x8a\xa4\xeb\x8a\x94 AVR\xec\x9d\xb4 \xed\x95\xa9\xeb\x8b\x88\xeb\x8b\xa4 (Dolby Surround \xc2\xb7 Auro-3D \xc2\xb7 Neural:X)"),
+                    b.withTrimmedTop (30.0f).withTrimmedBottom (6.0f).toNearestInt(), juce::Justification::centred);
+
+        paintBypass (g, t);
+    }
+
+    void drawReflection (juce::Graphics& g, const Theme& t, int p)
+    {
+        const auto& s = kGeo[p];
+        if (s.top) return;
+        const auto& n = neon[(size_t) p];
+        const float a = (t.dark ? 0.22f : 0.16f) * n.body + (t.dark ? 0.32f : 0.22f) * n.punch;
+        if (a <= 0.01f) return;
+        const float w = s.w * 2.2f + 34.0f * n.punch, h = 16.0f + 10.0f * n.punch;
+        const float cx = s.x + s.w * 0.5f, cy = s.y + s.h + 10.0f;
+        juce::ColourGradient grad (t.neon.withAlpha (juce::jmin (1.0f, a)), cx, cy, t.neon.withAlpha (0.0f), cx + w * 0.5f, cy, true);
+        g.setGradientFill (grad);
+        g.fillEllipse (cx - w * 0.5f, cy - h * 0.5f, w, h);
+    }
+
+    void paintBypass (juce::Graphics& g, const Theme& t)
+    {
         if (proc.isBypassed())
         {
             // Veil + label: the Atmos output is paused, the original goes to the host output.
@@ -872,6 +926,7 @@ private:
     {
         for (int p = 0; p < kNumChannels; ++p)
         {
+            if (ctx.stereoOnly && p > 1) continue;
             const auto& s = kGeo[p];
             if (juce::Rectangle<float> (s.x, s.y, s.w, s.h + 18.0f).expanded (8.0f).contains (pt)) return p;
         }
@@ -1252,7 +1307,8 @@ public:
 
         // Which upmixer is applied (the number table shown belongs to it: each slot keeps its own)
         const int a = proc.getActiveSlot();
-        const juce::String owner = a >= 0 ? proc.getSlot (a).name : tr ("업믹서 없음 (호스트 채널 1~12)");
+        const juce::String owner = ctx.stereoOnly ? tr ("AVR 업믹서 (2ch Stereo)")
+                                 : a >= 0 ? proc.getSlot (a).name : tr ("업믹서 없음 (호스트 채널 1~12)");
         g.setFont (uiFont (14.0f));
         g.setColour (t.sub);
         const juce::String label = tr ("적용된 업믹서:");
@@ -1261,6 +1317,23 @@ public:
         g.setColour (t.text);
         g.setFont (uiFont (14.0f, true));
         g.drawText (owner, 18 + labelW + 8, ry + 6, 404 - labelW - 8, 22, juce::Justification::centredLeft, true);
+    }
+
+    void paintOverChildren (juce::Graphics& g) override
+    {
+        if (! ctx.stereoOnly) return;
+        const auto& t = ctx.th();
+        const juce::Rectangle<float> v (12.0f, (float) (kRowY0 + 2 * kRowH) + 1.0f, 416.0f, (float) (10 * kRowH) - 1.0f);
+        g.setColour (t.panel.withAlpha (0.93f));
+        g.fillRect (v);
+        g.setColour (t.text);
+        g.setFont (uiFont (16.0f, true));
+        g.drawText (tr ("2ch Stereo: Ch 1 \xe2\x86\x92 L, Ch 2 \xe2\x86\x92 R"), v.withSizeKeepingCentre (404.0f, 24.0f).translated (0, -14).toNearestInt(),
+                    juce::Justification::centred);
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.0f));
+        g.drawText (tr ("Ch 3~12\xeb\x8a\x94 Atmos 7.1.4\xec\x97\x90\xec\x84\x9c \xec\x82\xac\xec\x9a\xa9\xed\x95\xa9\xeb\x8b\x88\xeb\x8b\xa4"),
+                    v.withSizeKeepingCentre (404.0f, 22.0f).translated (0, 14).toNearestInt(), juce::Justification::centred);
     }
 
 private:
@@ -1595,6 +1668,104 @@ private:
 };
 
 //==============================================================================
+// Static texts of the channel mapping panel (panel-local coordinates).
+void paintMapStatic (juce::Graphics& g, const Theme& t)
+{
+        drawHeading (g, t, tr ("채널 매핑"), { 18, 14, 200, 26 });
+    g.setColour (t.sub);
+    g.setFont (uiFont (14.5f));
+    g.drawText (tr ("입력 채널마다 출력 위치 번호를 지정합니다."), 18, 40, 230, 18, juce::Justification::centredLeft, true);
+    g.drawText (tr ("0=끄기"), 18, 58, 230, 18, juce::Justification::centredLeft, true);
+    g.setFont (uiFont (14.0f));
+    g.drawText (tr ("입력"), 18, 106, 50, 16, juce::Justification::centredLeft);
+    g.drawText (tr ("번호"), 76, 106, 56, 16, juce::Justification::centredLeft);
+    g.drawText (tr ("출력 위치"), 140, 106, 80, 16, juce::Justification::centredLeft);
+    g.drawText (tr ("노이즈"), 226, 106, 38, 16, juce::Justification::centred);
+    g.drawText (tr ("뮤트"), 268, 106, 38, 16, juce::Justification::centred);
+    g.drawText (tr ("레벨"), 312, 106, 60, 16, juce::Justification::centredLeft);
+    drawWrapped (g, tr ("핑크 노이즈 -20 dBFS RMS (LFE는 120 Hz 이하) \xc2\xb7 테스트 중에는 음악이 잠시 멈춥니다"),
+                 uiFont (14.0f), t.sub, { 18, 570, 404, 44 });
+}
+
+// Title block (logo, name, subtitle, optional badge such as "HOST").
+void paintTitleBlock (juce::Graphics& g, const Theme& t, const juce::String& subCyber, const juce::String& subPlain,
+                      const juce::String& badge = {})
+{
+
+    float textX = 78.0f;
+    if (t.roomStyle == 2)
+    {
+        // Sunset over the sea
+        const juce::Rectangle<float> logo (38.0f, 31.0f, 38.0f, 38.0f);
+        juce::Path circle; circle.addEllipse (logo);
+        juce::DropShadow (t.neon.withAlpha (0.30f), 12, { 0, 4 }).drawForPath (g, circle);
+        juce::ColourGradient grad (C (0xffffc47a), 0, logo.getY(), C (0xff0656b5), 0, logo.getBottom(), false);
+        grad.addColour (0.46, C (0xffff8f73));
+        grad.addColour (0.54, t.neon);
+        g.setGradientFill (grad);
+        g.fillPath (circle);
+        drawSpeakerIcon (g, logo.reduced (8.0f), juce::Colours::white, 2.0f);
+        textX = 90.0f;
+    }
+    else
+    {
+        drawSpeakerIcon (g, { 40.0f, 37.0f, 26.0f, 26.0f }, t.neon.withMultipliedBrightness (t.dark ? 1.0f : 0.95f), 1.8f);
+    }
+
+    const bool cyber = t.id == ThemeId::Cyberpunk;
+    const auto f = titleFont (t, cyber ? 21.0f : 22.0f);
+    const juce::String a = cyber ? "ATMOS BRIDGE " : "Atmos Bridge ";
+    const juce::String bText = "7.1.4ch";
+    const float wa = juce::GlyphArrangement::getStringWidth (f, a);
+    const float wb = juce::GlyphArrangement::getStringWidth (f, bText);
+    const juce::Rectangle<float> ra (textX, 26.0f, wa + 4.0f, 28.0f), rb (textX + wa, 26.0f, wb + 6.0f, 28.0f);
+
+    if (t.titleHighlight.getAlpha() > 0)
+    {
+        g.setColour (t.titleHighlight);
+        g.fillRect (rb.getX() - 1.0f, rb.getY() + 16.0f, wb + 4.0f, 10.0f);
+    }
+    if (cyber)
+    {
+        // Chromatic offset + neon glow
+        drawTextPath (g, a, f, ra.translated (2.0f, 0.0f), juce::Justification::centredLeft, C (0xffff2bd6).withAlpha (0.85f));
+        drawTextPath (g, a, f, ra.translated (-1.0f, 0.0f), juce::Justification::centredLeft, C (0xfffcee0a).withAlpha (0.5f));
+        drawTextPath (g, a, f, ra, juce::Justification::centredLeft, t.titleA, t.titleA.withAlpha (0.6f), 12);
+        drawTextPath (g, bText, f, rb, juce::Justification::centredLeft, t.titleB, t.titleB.withAlpha (0.8f), 10);
+    }
+    else
+    {
+        drawTextPath (g, a, f, ra, juce::Justification::centredLeft, t.titleA);
+        drawTextPath (g, bText, f, rb, juce::Justification::centredLeft, t.titleB);
+    }
+
+    if (cyber)
+    {
+        g.setColour (t.sub);
+        g.setFont (monoFont (14.0f).withExtraKerningFactor (0.12f));
+        g.drawText (subCyber, (int) textX, 53, 440, 16, juce::Justification::centredLeft);
+    }
+    else
+    {
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.0f));
+        g.drawText (subPlain, (int) textX, 53, 400, 16, juce::Justification::centredLeft);
+    }
+
+    if (badge.isNotEmpty())
+    {
+        const juce::Rectangle<float> chip (rb.getRight() + 8.0f, 30.0f, 52.0f, 22.0f);
+        g.setColour (t.dark ? t.accent.withAlpha (0.14f) : t.field);
+        g.fillRoundedRectangle (chip, 6.0f);
+        g.setColour (t.dark ? t.accent : t.btnBorder);
+        g.drawRoundedRectangle (chip.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (t.dark ? t.accent : t.dim);
+        g.setFont (monoFont (13.0f, true));
+        g.drawText (badge, chip.toNearestInt(), juce::Justification::centred);
+    }
+}
+
+//==============================================================================
 // Everything that does not change while audio plays: page, panels, title, headings. Cached as an image.
 class BackgroundView final : public juce::Component
 {
@@ -1630,7 +1801,7 @@ public:
         drawPanel (g, kMap.toFloat(), t);
         drawPanel (g, kRight.toFloat(), t);
 
-        paintTitle (g, t);
+        paintTitleBlock (g, t, tr ("// WINDOWS SPATIAL AUDIO \xe2\x86\x92 ATMOS (MAT)"), tr ("Windows Spatial Audio \xe2\x86\x92 Atmos (MAT)"));
 
         // Mode group
         {
@@ -1645,20 +1816,7 @@ public:
         // Map panel static texts
         g.saveState();
         g.setOrigin (kMap.getPosition());
-        drawHeading (g, t, tr ("채널 매핑"), { 18, 14, 200, 26 });
-        g.setColour (t.sub);
-        g.setFont (uiFont (14.5f));
-        g.drawText (tr ("입력 채널마다 출력 위치 번호를 지정합니다."), 18, 40, 230, 18, juce::Justification::centredLeft, true);
-        g.drawText (tr ("0=끄기"), 18, 58, 230, 18, juce::Justification::centredLeft, true);
-        g.setFont (uiFont (14.0f));
-        g.drawText (tr ("입력"), 18, 106, 50, 16, juce::Justification::centredLeft);
-        g.drawText (tr ("번호"), 76, 106, 56, 16, juce::Justification::centredLeft);
-        g.drawText (tr ("출력 위치"), 140, 106, 80, 16, juce::Justification::centredLeft);
-        g.drawText (tr ("노이즈"), 226, 106, 38, 16, juce::Justification::centred);
-        g.drawText (tr ("뮤트"), 268, 106, 38, 16, juce::Justification::centred);
-        g.drawText (tr ("레벨"), 312, 106, 60, 16, juce::Justification::centredLeft);
-        drawWrapped (g, tr ("핑크 노이즈 -20 dBFS RMS (LFE는 120 Hz 이하) \xc2\xb7 테스트 중에는 음악이 잠시 멈춥니다"),
-                     uiFont (14.0f), t.sub, { 18, 570, 404, 44 });
+        paintMapStatic (g, t);
         g.restoreState();
 
         // Right panel static texts
@@ -1688,69 +1846,6 @@ public:
     }
 
 private:
-    void paintTitle (juce::Graphics& g, const Theme& t)
-    {
-        float textX = 78.0f;
-        if (t.roomStyle == 2)
-        {
-            // Sunset over the sea
-            const juce::Rectangle<float> logo (38.0f, 31.0f, 38.0f, 38.0f);
-            juce::Path circle; circle.addEllipse (logo);
-            juce::DropShadow (t.neon.withAlpha (0.30f), 12, { 0, 4 }).drawForPath (g, circle);
-            juce::ColourGradient grad (C (0xffffc47a), 0, logo.getY(), C (0xff0656b5), 0, logo.getBottom(), false);
-            grad.addColour (0.46, C (0xffff8f73));
-            grad.addColour (0.54, t.neon);
-            g.setGradientFill (grad);
-            g.fillPath (circle);
-            drawSpeakerIcon (g, logo.reduced (8.0f), juce::Colours::white, 2.0f);
-            textX = 90.0f;
-        }
-        else
-        {
-            drawSpeakerIcon (g, { 40.0f, 37.0f, 26.0f, 26.0f }, t.neon.withMultipliedBrightness (t.dark ? 1.0f : 0.95f), 1.8f);
-        }
-
-        const bool cyber = t.id == ThemeId::Cyberpunk;
-        const auto f = titleFont (t, cyber ? 21.0f : 22.0f);
-        const juce::String a = cyber ? "ATMOS BRIDGE " : "Atmos Bridge ";
-        const juce::String bText = "7.1.4ch";
-        const float wa = juce::GlyphArrangement::getStringWidth (f, a);
-        const float wb = juce::GlyphArrangement::getStringWidth (f, bText);
-        const juce::Rectangle<float> ra (textX, 26.0f, wa + 4.0f, 28.0f), rb (textX + wa, 26.0f, wb + 6.0f, 28.0f);
-
-        if (t.titleHighlight.getAlpha() > 0)
-        {
-            g.setColour (t.titleHighlight);
-            g.fillRect (rb.getX() - 1.0f, rb.getY() + 16.0f, wb + 4.0f, 10.0f);
-        }
-        if (cyber)
-        {
-            // Chromatic offset + neon glow
-            drawTextPath (g, a, f, ra.translated (2.0f, 0.0f), juce::Justification::centredLeft, C (0xffff2bd6).withAlpha (0.85f));
-            drawTextPath (g, a, f, ra.translated (-1.0f, 0.0f), juce::Justification::centredLeft, C (0xfffcee0a).withAlpha (0.5f));
-            drawTextPath (g, a, f, ra, juce::Justification::centredLeft, t.titleA, t.titleA.withAlpha (0.6f), 12);
-            drawTextPath (g, bText, f, rb, juce::Justification::centredLeft, t.titleB, t.titleB.withAlpha (0.8f), 10);
-        }
-        else
-        {
-            drawTextPath (g, a, f, ra, juce::Justification::centredLeft, t.titleA);
-            drawTextPath (g, bText, f, rb, juce::Justification::centredLeft, t.titleB);
-        }
-
-        if (cyber)
-        {
-            g.setColour (t.sub);
-            g.setFont (monoFont (14.0f).withExtraKerningFactor (0.12f));
-            g.drawText (tr ("// WINDOWS SPATIAL AUDIO \xe2\x86\x92 ATMOS (MAT)"), (int) textX, 53, 440, 16, juce::Justification::centredLeft);
-        }
-        else
-        {
-            g.setColour (t.sub);
-            g.setFont (uiFont (14.0f));
-            g.drawText (tr ("Windows Spatial Audio \xe2\x86\x92 Atmos (MAT)"), (int) textX, 53, 400, 16, juce::Justification::centredLeft);
-        }
-    }
-
     const UiCtx& ctx;
 };
 
@@ -2288,6 +2383,943 @@ private:
     int dropouts = 0;
 };
 
+#if AB_HOST_UI
+//==============================================================================
+// Host app (UI preview): Atmos Bridge as a standalone host.
+//   INPUT (CABLE In, direct loopback) -> 2ch plugin chain -> [Atmos: upmixer -> 12ch -> spatial audio]
+//                                                           [2ch Stereo: WASAPI exclusive PCM 2.0 -> AVR upmixers]
+//==============================================================================
+namespace
+{
+const juce::Rectangle<float> kHHeader { 20.0f, 20.0f, 1700.0f, 60.0f };
+const juce::Rectangle<float> kHIo     { 20.0f, 92.0f, 1700.0f, 64.0f };
+const juce::Rectangle<int>   kHRoom   { 20, 168, 780, 620 };
+const juce::Rectangle<int>   kHMap    { 820, 168, 440, 620 };
+const juce::Rectangle<int>   kHRight  { 1280, 168, 440, 620 };
+const juce::Rectangle<float> kHFooter { 20.0f, 804.0f, 1700.0f, 60.0f };
+const juce::Rectangle<float> kHStatus { 702.0f, 34.0f, 440.0f, 32.0f };
+const juce::Rectangle<float> kHFormat { 1154.0f, 32.0f, 316.0f, 36.0f };
+const juce::Rectangle<float> kHRate   { 506.0f, 117.0f, 112.0f, 32.0f };
+const juce::Rectangle<float> kHDrop   { 1100.0f, 816.0f, 70.0f, 36.0f };
+constexpr int kHostW = 1740, kHostH = 884;
+
+struct FxPreview { juce::String name, layout; double latencyMs; bool bypass; int scope; };   // scope: 0 both, 1 2ch only, 2 Atmos only
+
+const char* scopeText (int s) { return s == 1 ? "2ch \xeb\xa7\x8c" : s == 2 ? "Atmos \xeb\xa7\x8c" : "2ch \xc2\xb7 Atmos"; }
+
+void groupFrame (juce::Graphics& g, const Theme& t, juce::Rectangle<float> r)
+{
+    const auto shape = t.chamfer ? panelShape (r, t, 10.0f) : [&] { juce::Path p; p.addRoundedRectangle (r, 10.0f); return p; }();
+    g.setColour (t.field);
+    g.fillPath (shape);
+    g.setColour (t.dark ? C (0xffff2bd6).withAlpha (0.4f) : t.panelBorder);
+    g.strokePath (shape, juce::PathStrokeType (1.0f));
+}
+} // namespace
+
+//==============================================================================
+// One plugin of the 2ch chain: drag handle, number, name (click = settings), scope chip, B (bypass), D (delete).
+class FxRow final : public juce::Component, public juce::SettableTooltipClient
+{
+public:
+    explicit FxRow (const UiCtx& c) : ctx (c)
+    {
+        for (auto* b : { &scopeBtn, &bypBtn, &delBtn })
+        {
+            b->getProperties().set ("radius", 6.0);
+            addAndMakeVisible (*b);
+        }
+        bypBtn.getProperties().set ("mono", true);
+        delBtn.getProperties().set ("mono", true);
+        bypBtn.setButtonText ("B");
+        delBtn.setButtonText ("D");
+        scopeBtn.setTooltip (tr ("어느 출력 형식에서 쓸지: 2ch \xc2\xb7 Atmos / 2ch만 / Atmos만 (누를 때마다 바뀜). "
+                                 "XTC(zBACCH 등)는 2ch만으로 두면 Atmos에서는 자동으로 쉽니다."));
+        bypBtn.setTooltip (tr ("바이패스: 이 플러그인만 건너뜀 (지연에서도 빠짐)"));
+        delBtn.setTooltip (tr ("체인에서 삭제"));
+        setTooltip (tr ("이름을 누르면 설정 창 \xc2\xb7 \xe2\x89\xa1 끌어서 순서 변경"));
+    }
+
+    void setData (const FxPreview& d, int index, bool stereo)
+    {
+        data = d;
+        idx = index;
+        idle = (stereo && d.scope == 2) || (! stereo && d.scope == 1);
+        const auto& t = ctx.th();
+        scopeBtn.setButtonText (tr (scopeText (d.scope)));
+        scopeBtn.setColour (juce::TextButton::buttonColourId, t.btn);
+        scopeBtn.setColour (juce::TextButton::textColourOffId, d.scope == 0 ? t.dim : (t.dark ? t.accent : t.text));
+        setBorder (scopeBtn, d.scope == 0 ? t.btnBorder : (t.dark ? t.accent.withAlpha (0.7f) : t.dim));
+        bypBtn.setColour (juce::TextButton::buttonColourId, d.bypass ? t.bypBg : t.btn);
+        bypBtn.setColour (juce::TextButton::textColourOffId, d.bypass ? t.bypFg : t.dim);
+        setBorder (bypBtn, d.bypass ? t.bypBorder : t.btnBorder);
+        stylePlain (delBtn, t);
+        delBtn.setColour (juce::TextButton::textColourOffId, t.dim);
+        for (auto* b : { &scopeBtn, &bypBtn, &delBtn }) b->repaint();
+        repaint();
+    }
+
+    void resized() override
+    {
+        const int y = (getHeight() - 28) / 2;
+        scopeBtn.setBounds (getWidth() - 160, y, 86, 28);
+        bypBtn.setBounds (getWidth() - 68, y, 28, 28);
+        delBtn.setBounds (getWidth() - 36, y, 28, 28);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& t = ctx.th();
+        const auto r = getLocalBounds().toFloat().reduced (0.5f);
+        const bool on = ! data.bypass && ! idle;
+        g.setColour (on ? (t.dark ? t.neon.withAlpha (0.06f) : t.panel.interpolatedWith (t.neon, 0.05f)) : t.slotOffBg);
+        g.fillRoundedRectangle (r, 8.0f);
+        g.setColour (on ? (t.dark ? t.neon.withAlpha (0.55f) : t.neon.withAlpha (0.6f)) : t.slotOffBorder);
+        g.drawRoundedRectangle (r, 8.0f, 1.0f);
+
+        const float a = idle ? 0.5f : 1.0f;
+        g.setColour (t.sub.withMultipliedAlpha (a));                       // drag handle
+        for (int k = 0; k < 3; ++k) g.fillRoundedRectangle (12.0f, (float) getHeight() * 0.5f - 6.0f + (float) k * 5.0f, 12.0f, 2.0f, 1.0f);
+        g.setColour (t.sub.withMultipliedAlpha (a));
+        g.setFont (monoFont (14.0f, true));
+        g.drawText (juce::String (idx + 1), 30, 0, 16, getHeight(), juce::Justification::centred);
+
+        g.setColour (t.text.withMultipliedAlpha (a));
+        g.setFont (uiFont (15.5f, true));
+        g.drawText (data.name, 52, 5, getWidth() - 220, 20, juce::Justification::centredLeft, true);
+
+        juce::String info;
+        juce::Colour infoCol = t.sub;
+        if (idle)           info = data.scope == 1 ? tr ("2ch 전용 \xc2\xb7 Atmos에서 쉼") : tr ("Atmos 전용 \xc2\xb7 2ch에서 쉼");
+        else if (data.bypass) { info = tr ("바이패스"); infoCol = t.bypFg; }
+        else                info = data.layout + tr (" \xc2\xb7 CH 1-2 \xc2\xb7 ") + juce::String (data.latencyMs, 1) + " ms";
+        g.setColour (infoCol.withMultipliedAlpha (a));
+        g.setFont (uiFont (13.0f));
+        g.drawText (info, 52, 25, getWidth() - 220, 17, juce::Justification::centredLeft, true);
+    }
+
+    juce::TextButton scopeBtn, bypBtn, delBtn;
+
+private:
+    const UiCtx& ctx;
+    FxPreview data;
+    int idx = 0;
+    bool idle = false;
+};
+
+//==============================================================================
+// Right panel of the host: clipping prevention + BYPASS, 2ch plugin chain, upmixers (Atmos only).
+class HostRightPanel final : public juce::Component
+{
+public:
+    static constexpr int kFxY0 = 162, kFxH = 46, kFxStep = 52, kMaxFxShown = 3;
+    static constexpr int kUpY0 = 410, kUpH = 56, kUpStep = 64;
+
+    HostRightPanel (AtmosBridgeProcessor& p, const UiCtx& c) : proc (p), ctx (c), fxAdd (c), upAdd (c)
+    {
+        limBtn.getProperties().set ("radius", 16.0);
+        limBtn.getProperties().set ("bold", true);
+        limBtn.setTooltip (tr ("-1.0 dBFS를 넘지 않게 모든 채널을 같은 비율로 줄입니다 (지연 0 ms)"));
+        limBtn.onClick = [this] { proc.setLimiterOn (! proc.isLimiterOn()); };
+        addAndMakeVisible (limBtn);
+
+        bypassBtn.getProperties().set ("radius", 16.0);
+        bypassBtn.getProperties().set ("bold", true);
+        bypassBtn.setButtonText ("BYPASS");
+        bypassBtn.setTooltip (tr ("전체 바이패스: 플러그인 \xc2\xb7 업믹서 \xc2\xb7 번호표를 거치지 않은 원본을 그대로 출력"));
+        bypassBtn.onClick = [this] { proc.setBypassed (! proc.isBypassed()); };
+        addAndMakeVisible (bypassBtn);
+
+        for (int i = 0; i < kMaxFxShown; ++i)
+        {
+            fxRows[(size_t) i] = std::make_unique<FxRow> (ctx);
+            auto& r = *fxRows[(size_t) i];
+            r.scopeBtn.onClick = [this, i] { if (i < (int) fx.size()) fx[(size_t) i].scope = (fx[(size_t) i].scope + 1) % 3; dirty = true; refresh(); };
+            r.bypBtn.onClick   = [this, i] { if (i < (int) fx.size()) fx[(size_t) i].bypass = ! fx[(size_t) i].bypass; dirty = true; refresh(); };
+            r.delBtn.onClick   = [this, i] { if (i < (int) fx.size()) fx.erase (fx.begin() + i); dirty = true; refresh(); };
+            addChildComponent (r);
+        }
+        fxAdd.setButtonText (tr ("+ 플러그인 추가 (스테레오 VST3)"));
+        fxAdd.setTooltip (tr ("RoomSpace \xc2\xb7 Fresh Air \xc2\xb7 zBACCH 같은 스테레오 플러그인. 위에서부터 순서대로 적용"));
+        addAndMakeVisible (fxAdd);
+
+        for (int i = 0; i < 2; ++i)
+        {
+            upRows[(size_t) i] = std::make_unique<SlotRow> (ctx);
+            auto& r = *upRows[(size_t) i];
+            r.onBtn.onClick  = [this, i] { proc.toggleSlotActive (i); };
+            r.bypBtn.onClick = [this, i] { proc.toggleSlotBypass (i); };
+            r.delBtn.onClick = [this, i] { proc.removeSlot (i); };
+            addChildComponent (r);
+        }
+        upAdd.setButtonText (tr ("+ 업믹서 추가 (최대 4개)"));
+        addAndMakeVisible (upAdd);
+
+        fx = { { "RoomSpace", tr ("Stereo"), 1.0, false, 0 },
+               { "Fresh Air", tr ("Stereo"), 0.0, false, 0 },
+               { "zBACCH",    tr ("Stereo"), 10.7, false, 1 } };
+    }
+
+    std::vector<FxPreview> fx;
+
+    // Latency of the plugins that run in this format (2ch chain + the upmixer in Atmos)
+    double pluginLatencyMs() const
+    {
+        double ms = ctx.stereoOnly ? 0.0 : proc.getUpmixerLatencyMs();
+        for (const auto& f : fx)
+            if (! f.bypass && ! ((ctx.stereoOnly && f.scope == 2) || (! ctx.stereoOnly && f.scope == 1))) ms += f.latencyMs;
+        return ms;
+    }
+
+    void resized() override
+    {
+        limBtn.setBounds (18, 72, 82, 32);
+        bypassBtn.setBounds (234, 72, 108, 32);
+        layoutRows();
+    }
+
+    void refresh()
+    {
+        const auto& t = ctx.th();
+        const bool lim = proc.isLimiterOn();
+        if (lim != shownLimiter || dirty)
+        {
+            shownLimiter = lim;
+            limBtn.setButtonText (lim ? tr ("켜짐") : tr ("꺼짐"));
+            styleToggle (limBtn, t, lim);
+            limBtn.repaint();
+        }
+        const bool byp = proc.isBypassed();
+        if (byp != shownBypass || dirty)
+        {
+            shownBypass = byp;
+            bypassBtn.setColour (juce::TextButton::buttonColourId, byp ? t.bypBorder : t.btn);
+            bypassBtn.setColour (juce::TextButton::textColourOffId, byp ? (t.dark ? C (0xff1a1600) : t.titleA) : t.dim);
+            setBorder (bypassBtn, byp ? t.bypBorder : t.btnBorder);
+            bypassBtn.repaint();
+            repaint();
+        }
+        const int n = proc.getNumSlots();
+        if (dirty || ctx.stereoOnly != shownStereo || proc.getSlotsVersion() != shownVersion || n != shownCount)
+        {
+            shownStereo = ctx.stereoOnly;
+            shownVersion = proc.getSlotsVersion();
+            shownCount = n;
+            for (int i = 0; i < kMaxFxShown; ++i)
+            {
+                auto& r = *fxRows[(size_t) i];
+                r.setVisible (i < (int) fx.size());
+                if (i < (int) fx.size()) r.setData (fx[(size_t) i], i, ctx.stereoOnly);
+            }
+            for (int i = 0; i < 2; ++i)
+            {
+                auto& r = *upRows[(size_t) i];
+                r.setVisible (i < n);
+                if (i < n) r.setData (proc.getSlot (i));
+                r.setEnabled (! ctx.stereoOnly);
+            }
+            upAdd.setEnabled (! ctx.stereoOnly);
+            layoutRows();
+            repaint();
+        }
+        dirty = false;
+    }
+
+    void themeChanged() { dirty = true; fxAdd.repaint(); upAdd.repaint(); refresh(); }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& t = ctx.th();
+        drawHeading (g, t, tr ("클리핑 방지"), { 18, 14, 190, 26 });
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.5f));
+        g.drawText (tr ("-1.0 dBFS \xc2\xb7 채널 연동"), 18, 42, 196, 20, juce::Justification::centredLeft);
+        g.setColour (t.divider);
+        g.fillRect (220.0f, 18.0f, 1.0f, 86.0f);
+        drawHeading (g, t, "BYPASS", { 234, 14, 188, 26 });
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.5f));
+        g.drawText (tr ("원본 그대로 출력"), 234, 42, 188, 20, juce::Justification::centredLeft);
+        g.setFont (uiFont (13.5f));
+        g.setColour (shownBypass ? t.bypFg : t.sub);
+        g.drawText (shownBypass ? tr ("바이패스 중") : tr ("꺼짐"), 350, 72, 72, 32, juce::Justification::centredLeft);
+
+        g.setColour (t.divider);
+        g.fillRect (18.0f, 118.0f, 404.0f, 1.0f);
+        drawHeading (g, t, tr ("2ch 플러그인"), { 18, 128, 140, 26 });
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.0f));
+        g.drawText (tr ("CH 1-2 \xc2\xb7 위에서부터 순서대로 \xc2\xb7 모든 모드에서 적용"), 150, 128, 272, 26, juce::Justification::centredRight, true);
+
+        const int upHead = kUpY0 - 38;
+        g.setColour (t.divider);
+        g.fillRect (18.0f, (float) upHead - 10.0f, 404.0f, 1.0f);
+        drawHeading (g, t, tr ("업믹서"), { 18, (float) upHead, 100, 26 });
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.0f));
+        g.drawText (tr ("Atmos 7.1.4 전용 \xc2\xb7 2 \xe2\x86\x92 12ch \xc2\xb7 O/X B D"), 104, upHead, 318, 26, juce::Justification::centredRight, true);
+
+        drawWrapped (g, tr ("이름을 누르면 설정 창 \xc2\xb7 \xe2\x89\xa1 끌어서 순서 변경 \xc2\xb7 플러그인 \xc2\xb7 라우팅 \xc2\xb7 번호표는 프리셋으로 저장"),
+                     uiFont (13.5f), t.sub, { 18, 578, 404, 40 });
+    }
+
+    void paintOverChildren (juce::Graphics& g) override
+    {
+        if (! ctx.stereoOnly) return;
+        const auto& t = ctx.th();
+        const juce::Rectangle<float> v (12.0f, (float) kUpY0 - 4.0f, 416.0f, 2.0f * kUpStep + 44.0f);
+        g.setColour (t.panel.withAlpha (0.9f));
+        g.fillRect (v);
+        g.setColour (t.text);
+        g.setFont (uiFont (15.5f, true));
+        g.drawText (tr ("2ch Stereo: 업믹스는 AVR이 합니다"), v.withSizeKeepingCentre (404.0f, 22.0f).translated (0, -12).toNearestInt(), juce::Justification::centred);
+        g.setColour (t.sub);
+        g.setFont (uiFont (13.5f));
+        g.drawText (tr ("Dolby Surround \xc2\xb7 Auro-3D \xc2\xb7 Neural:X \xc2\xb7 VST 업믹서는 쉼 (지연 0)"),
+                    v.withSizeKeepingCentre (404.0f, 20.0f).translated (0, 12).toNearestInt(), juce::Justification::centred);
+    }
+
+private:
+    void layoutRows()
+    {
+        for (int i = 0; i < kMaxFxShown; ++i)
+            fxRows[(size_t) i]->setBounds (18, kFxY0 + i * kFxStep, 404, kFxH);
+        fxAdd.setBounds (18, kFxY0 + (int) juce::jmin ((int) fx.size(), kMaxFxShown) * kFxStep, 404, 34);
+        const int n = juce::jmin (2, proc.getNumSlots());
+        for (int i = 0; i < 2; ++i)
+            upRows[(size_t) i]->setBounds (18, kUpY0 + i * kUpStep, 404, kUpH);
+        upAdd.setBounds (18, kUpY0 + n * kUpStep, 404, 34);
+    }
+
+    AtmosBridgeProcessor& proc;
+    const UiCtx& ctx;
+    juce::TextButton limBtn, bypassBtn;
+    std::array<std::unique_ptr<FxRow>, kMaxFxShown> fxRows;
+    std::array<std::unique_ptr<SlotRow>, 2> upRows;
+    AddButton fxAdd, upAdd;
+    bool shownLimiter = false, shownBypass = false, shownStereo = false, dirty = true;
+    int shownVersion = -1, shownCount = -1;
+};
+
+//==============================================================================
+// "Exclusive" check (2ch Stereo: always on; Atmos: not possible).
+class ExclusiveCheck final : public juce::Button
+{
+public:
+    explicit ExclusiveCheck (const UiCtx& c) : juce::Button ("exclusive"), ctx (c) {}
+    bool checked = true;
+
+    void paintButton (juce::Graphics& g, bool, bool) override
+    {
+        const auto& t = ctx.th();
+        const bool en = isEnabled();
+        auto r = getLocalBounds().toFloat().reduced (0.5f);
+        g.setColour (t.field);
+        g.fillRoundedRectangle (r, 7.0f);
+        g.setColour (t.btnBorder.withMultipliedAlpha (en ? 1.0f : 0.5f));
+        g.drawRoundedRectangle (r, 7.0f, 1.0f);
+        const juce::Rectangle<float> box (10.0f, r.getCentreY() - 9.0f, 18.0f, 18.0f);
+        g.setColour (checked ? (t.dark ? t.neon.withAlpha (0.18f) : t.accent) : t.btn);
+        g.fillRoundedRectangle (box, 4.0f);
+        g.setColour (checked ? (t.dark ? t.neon : t.accent) : t.btnBorder);
+        g.drawRoundedRectangle (box, 4.0f, 1.2f);
+        if (checked)
+        {
+            juce::Path tick;
+            tick.startNewSubPath (box.getX() + 4.0f, box.getCentreY());
+            tick.lineTo (box.getX() + 7.5f, box.getBottom() - 4.5f);
+            tick.lineTo (box.getRight() - 4.0f, box.getY() + 4.5f);
+            g.setColour (t.dark ? t.neon : t.activeText);
+            g.strokePath (tick, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+        }
+        g.setColour (en ? (checked ? (t.dark ? t.clip : t.amber) : t.text) : t.sub);
+        g.setFont (uiFont (15.0f, true));
+        g.drawText (en ? tr ("Exclusive (배타)") : tr ("Exclusive: Atmos 불가"), 36, 0, getWidth() - 40, getHeight(), juce::Justification::centredLeft, true);
+    }
+
+private:
+    const UiCtx& ctx;
+};
+
+//==============================================================================
+// Routing window content: input channels -> processing channels (matrix) + per-input gain/mute.
+class RoutingView final : public juce::Component
+{
+public:
+    static constexpr int kW = 1180, kH = 780;
+    static constexpr int kIns = 16, kProcs = 12;
+    static constexpr float kX0 = 150.0f, kY0 = 178.0f, kCw = 38.0f, kCh = 31.0f;
+
+    explicit RoutingView (const UiCtx& c) : ctx (c)
+    {
+        for (int i = 0; i < kIns; ++i) for (int p = 0; p < kProcs; ++p) on[(size_t) i][(size_t) p] = (i == p && i < 2);
+        const char* tabNames[2] = { "입력 \xe2\x86\x92 처리", "처리 \xe2\x86\x92 스피커 (번호표)" };
+        for (int k = 0; k < 2; ++k)
+        {
+            tabs[(size_t) k].setButtonText (tr (tabNames[k]));
+            tabs[(size_t) k].getProperties().set ("radius", 8.0);
+            addAndMakeVisible (tabs[(size_t) k]);
+        }
+        const char* names[4] = { "1:1 기본", "L \xe2\x86\x94 R 바꾸기", "모노 합치기", "지우기" };
+        for (int k = 0; k < 4; ++k)
+        {
+            tools[(size_t) k].setButtonText (tr (names[k]));
+            tools[(size_t) k].getProperties().set ("radius", 8.0);
+            addAndMakeVisible (tools[(size_t) k]);
+        }
+        tools[0].onClick = [this] { for (int i = 0; i < kIns; ++i) for (int p = 0; p < kProcs; ++p) on[(size_t) i][(size_t) p] = (i == p && i < 2); repaint(); };
+        tools[1].onClick = [this] { std::swap (on[0], on[1]); repaint(); };
+        tools[2].onClick = [this] { on[0][0] = on[0][1] = on[1][0] = on[1][1] = true; repaint(); };
+        tools[3].onClick = [this] { for (auto& row : on) row.fill (false); repaint(); };
+        setSize (kW, kH);
+    }
+
+    void style()
+    {
+        const auto& t = ctx.th();
+        for (int k = 0; k < 2; ++k) styleToggle (tabs[(size_t) k], t, k == 0);
+        for (auto& b : tools) stylePlain (b, t);
+    }
+
+    void resized() override
+    {
+        tabs[0].setBounds (30, 78, 190, 36);
+        tabs[1].setBounds (228, 78, 250, 36);
+        for (int k = 0; k < 4; ++k) tools[(size_t) k].setBounds (30 + k * 140, kH - 66, 130, 38);
+    }
+
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        const int p = (int) std::floor ((e.position.x - kX0) / kCw), i = (int) std::floor ((e.position.y - kY0) / kCh);
+        if (p >= 0 && p < kProcs && i >= 0 && i < kIns) { on[(size_t) i][(size_t) p] = ! on[(size_t) i][(size_t) p]; repaint(); }
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& t = ctx.th();
+        g.fillAll (t.bgTop);
+        drawPanel (g, getLocalBounds().toFloat().reduced (14.0f), t);
+        drawHeading (g, t, tr ("라우팅"), { 30, 28, 200, 30 }, 21.0f);
+        g.setColour (t.sub);
+        g.setFont (uiFont (14.5f));
+        g.drawText (tr ("CABLE In 채널을 처리 채널로 연결합니다. 처리 1~2 \xe2\x86\x92 2ch 플러그인 \xe2\x86\x92 (Atmos) 업믹서 \xe2\x86\x92 번호표 \xe2\x86\x92 스피커"),
+                    200, 30, kW - 240, 28, juce::Justification::centredLeft, true);
+
+        const bool stereo = ctx.stereoOnly;
+        // Column headers
+        g.setFont (monoFont (13.0f, true));
+        for (int p = 0; p < kProcs; ++p)
+        {
+            const bool used = ! stereo || p < 2;
+            g.setColour ((p < 2 ? t.text : t.sub).withMultipliedAlpha (used ? 1.0f : 0.45f));
+            g.drawText ("P" + juce::String (p + 1), juce::Rectangle<float> (kX0 + p * kCw, kY0 - 30.0f, kCw, 20.0f).toNearestInt(), juce::Justification::centred);
+        }
+        g.setColour (t.sub);
+        g.setFont (uiFont (13.0f));
+        g.drawText (tr ("처리 채널 \xe2\x86\x92"), juce::Rectangle<float> (kX0, kY0 - 54.0f, 200.0f, 20.0f).toNearestInt(), juce::Justification::centredLeft);
+        g.drawText (tr ("입력 \xe2\x86\x93"), juce::Rectangle<float> (30.0f, kY0 - 30.0f, 110.0f, 20.0f).toNearestInt(), juce::Justification::centredLeft);
+
+        for (int i = 0; i < kIns; ++i)
+        {
+            const float y = kY0 + i * kCh;
+            const bool live = i < 2;   // the source plays 2ch: channels 3..16 stay silent
+            g.setColour ((live ? t.text : t.sub).withMultipliedAlpha (live ? 1.0f : 0.6f));
+            g.setFont (monoFont (14.0f, live));
+            g.drawText ("In " + juce::String (i + 1) + (i == 0 ? "  L" : i == 1 ? "  R" : ""), juce::Rectangle<float> (30.0f, y, 110.0f, kCh).toNearestInt(),
+                        juce::Justification::centredLeft);
+            for (int p = 0; p < kProcs; ++p)
+            {
+                const auto cell = juce::Rectangle<float> (kX0 + p * kCw, y, kCw, kCh).reduced (1.5f);
+                const bool used = ! stereo || p < 2;
+                g.setColour (t.field.withMultipliedAlpha (used ? 1.0f : 0.5f));
+                g.fillRect (cell);
+                if (on[(size_t) i][(size_t) p])
+                {
+                    const auto dot = cell.withSizeKeepingCentre (16.0f, 16.0f);
+                    if (t.dark) { g.setColour (t.neon.withAlpha (0.3f)); g.fillEllipse (dot.expanded (3.0f)); }
+                    g.setColour ((t.dark ? t.neon : t.accent).withMultipliedAlpha (used ? 1.0f : 0.4f));
+                    g.fillEllipse (dot);
+                }
+            }
+
+            // Gain + mute (per input)
+            const float gx = kX0 + kProcs * kCw + 44.0f;
+            g.setColour (t.sub.withMultipliedAlpha (live ? 1.0f : 0.6f));
+            g.setFont (monoFont (13.0f));
+            g.drawText ("In " + juce::String (i + 1), juce::Rectangle<float> (gx, y, 52.0f, kCh).toNearestInt(), juce::Justification::centredLeft);
+            const juce::Rectangle<float> track (gx + 58.0f, y + kCh * 0.5f - 2.0f, 190.0f, 4.0f);
+            g.setColour (t.field);
+            g.fillRoundedRectangle (track, 2.0f);
+            const float knobX = track.getX() + track.getWidth() * 0.8f;
+            g.setColour ((t.dark ? t.neon : t.accent).withMultipliedAlpha (live ? 0.8f : 0.35f));
+            g.fillRoundedRectangle (track.withRight (knobX), 2.0f);
+            g.fillEllipse (knobX - 6.0f, track.getCentreY() - 6.0f, 12.0f, 12.0f);
+            const juce::Rectangle<float> db (track.getRight() + 14.0f, y + 3.0f, 70.0f, kCh - 6.0f);
+            g.setColour (t.field);
+            g.fillRoundedRectangle (db, 5.0f);
+            g.setColour (t.btnBorder);
+            g.drawRoundedRectangle (db.reduced (0.5f), 5.0f, 1.0f);
+            g.setColour (t.text.withMultipliedAlpha (live ? 1.0f : 0.6f));
+            g.drawText ("0.0 dB", db.toNearestInt(), juce::Justification::centred);
+            const juce::Rectangle<float> m (db.getRight() + 10.0f, y + 3.0f, 28.0f, kCh - 6.0f);
+            g.setColour (t.btn);
+            g.fillRoundedRectangle (m, 5.0f);
+            g.setColour (t.btnBorder);
+            g.drawRoundedRectangle (m.reduced (0.5f), 5.0f, 1.0f);
+            g.setColour (t.dim);
+            g.setFont (monoFont (13.0f, true));
+            g.drawText ("M", m.toNearestInt(), juce::Justification::centred);
+        }
+
+        if (stereo)
+        {
+            const juce::Rectangle<float> v (kX0 + 2 * kCw + 4.0f, kY0 + 2.0f, 10 * kCw - 8.0f, 54.0f);
+            g.setColour (t.panel.withAlpha (0.92f));
+            g.fillRoundedRectangle (v, 8.0f);
+            g.setColour (t.text);
+            g.setFont (uiFont (14.5f, true));
+            g.drawText (tr ("2ch Stereo: 처리 1~2만 사용"), v.withHeight (28.0f).translated (0, 4).toNearestInt(), juce::Justification::centred);
+            g.setColour (t.sub);
+            g.setFont (uiFont (13.0f));
+            g.drawText (tr ("P3~P12는 Atmos 7.1.4 (업믹서를 끄고 12ch 원본을 받을 때)"), v.withTrimmedTop (28.0f).toNearestInt(), juce::Justification::centred);
+        }
+
+        g.setColour (t.sub);
+        g.setFont (uiFont (13.5f));
+        g.drawText (tr ("점을 눌러 연결/해제 \xc2\xb7 한 입력을 여러 처리 채널로 보내거나 여러 입력을 합칠 수 있음 \xc2\xb7 In 3~16은 소스가 다채널일 때"),
+                    600, kH - 66, kW - 630, 38, juce::Justification::centredRight, true);
+    }
+
+private:
+    const UiCtx& ctx;
+    std::array<std::array<bool, kProcs>, kIns> on {};
+    std::array<juce::TextButton, 2> tabs;
+    std::array<juce::TextButton, 4> tools;
+};
+
+//==============================================================================
+// Static background of the host window.
+class HostBackground final : public juce::Component
+{
+public:
+    explicit HostBackground (const UiCtx& c) : ctx (c) { setInterceptsMouseClicks (false, false); setBufferedToImage (true); }
+
+    void paint (juce::Graphics& g) override
+    {
+        const auto& t = ctx.th();
+        const auto b = getLocalBounds().toFloat();
+        juce::ColourGradient page (t.bgTop, 0, 0, t.bgBottom, 0, b.getHeight(), false);
+        page.addColour (0.45, t.bgMid);
+        g.setGradientFill (page);
+        g.fillAll();
+        if (t.grid)
+        {
+            g.setColour (C (0xff00f0ff).withAlpha (0.05f));
+            for (float x = 0; x < b.getWidth(); x += 40.0f) g.fillRect (x, 0.0f, 1.0f, b.getHeight());
+            for (float y = 0; y < b.getHeight(); y += 40.0f) g.fillRect (0.0f, y, b.getWidth(), 1.0f);
+        }
+        drawPanel (g, kHHeader, t, t.headerEnd, t.headerBorder);
+        drawPanel (g, kHIo, t, t.headerEnd, t.headerBorder);
+        drawPanel (g, kHFooter, t, t.footerEnd, t.footerBorder);
+        if (t.shadow)
+            juce::DropShadow (t.shadowColour, 22, { 0, 6 }).drawForPath (g, panelShape (kHRoom.toFloat(), t));
+        drawPanel (g, kHMap.toFloat(), t);
+        drawPanel (g, kHRight.toFloat(), t);
+
+        paintTitleBlock (g, t, tr ("// CABLE IN \xe2\x86\x92 2CH PCM \xc2\xb7 ATMOS (MAT)"), tr ("CABLE In \xe2\x86\x92 2ch PCM \xc2\xb7 Atmos (MAT)"), "HOST");
+        groupFrame (g, t, kHFormat);
+        groupFrame (g, t, kModeGroup);
+
+        g.setColour (t.sub);
+        g.setFont (uiFont (13.0f, true));
+        g.drawText ("INPUT", 42, 97, 200, 16, juce::Justification::centredLeft);
+        g.drawText ("ENGINE", 508, 97, 200, 16, juce::Justification::centredLeft);
+        g.drawText ("OUTPUT", 1062, 97, 200, 16, juce::Justification::centredLeft);
+        g.setColour (t.divider);
+        g.fillRect (492.0f, 102.0f, 1.0f, 44.0f);
+        g.fillRect (1048.0f, 102.0f, 1.0f, 44.0f);
+        g.fillRect (1510.0f, 102.0f, 1.0f, 44.0f);
+
+        g.saveState();
+        g.setOrigin (kHMap.getPosition());
+        paintMapStatic (g, t);
+        g.restoreState();
+    }
+
+private:
+    const UiCtx& ctx;
+};
+
+//==============================================================================
+class HostRootView final : public juce::Component
+{
+public:
+    HostRootView (AtmosBridgeProcessor& p, UiCtx& c)
+        : proc (p), ctx (c), background (c), room (p, c), map (p, c), right (p, c), excl (c), scanlines (c)
+    {
+        addAndMakeVisible (background);
+        addAndMakeVisible (room);
+        addAndMakeVisible (map);
+        addAndMakeVisible (right);
+
+        static const char* modeNames[kNumModes] = { "기본", "저지연", "초저지연+" };
+        static const char* modeTips[kNumModes] = {
+            "기본: 여유 버퍼를 넉넉하게 (가장 안정적)",
+            "저지연: 여유 버퍼 자동 보정 (끊김 0 우선)",
+            "초저지연+: 패킷 도착과 출력 타이밍까지 맞춰 여유를 더 줄임"
+        };
+        for (int m = 0; m < kNumModes; ++m)
+        {
+            auto& b = modeBtn[(size_t) m];
+            b.setButtonText (tr (modeNames[m]));
+            b.setTooltip (tr (modeTips[m]));
+            b.getProperties().set ("radius", 7.0);
+            b.onClick = [this, m] { proc.setMode ((LatencyMode) m); };
+            addAndMakeVisible (b);
+        }
+
+        static const char* fmtNames[2] = { "2ch Stereo", "Atmos 7.1.4" };
+        static const char* fmtTips[2] = {
+            "2ch Stereo: PCM 2.0을 배타 모드로 AVR에 보냅니다. AVR 업믹서(Dolby Surround \xc2\xb7 Auro-3D \xc2\xb7 Neural:X)를 쓰고, XTC(zBACCH 등)를 쓸 때는 AVR을 Stereo로",
+            "Atmos 7.1.4: 업믹서로 12채널을 만들어 Windows 공간 음향(Dolby Atmos for home theater)으로 보냅니다"
+        };
+        for (int f = 0; f < 2; ++f)
+        {
+            auto& b = fmtBtn[(size_t) f];
+            b.setButtonText (fmtNames[f]);
+            b.setTooltip (tr (fmtTips[f]));
+            b.getProperties().set ("radius", 7.0);
+            b.getProperties().set ("bold", true);
+            b.onClick = [this, f] { setStereo (f == 0); };
+            addAndMakeVisible (b);
+        }
+
+        for (int i = 0; i < kNumThemes; ++i)
+            themeBox.addItem (themeFor ((ThemeId) i).menuName, i + 1);
+        themeBox.onChange = [this]
+        {
+            const int id = themeBox.getSelectedId();
+            if (id > 0 && (ThemeId) (id - 1) != proc.getTheme()) proc.setTheme ((ThemeId) (id - 1));
+        };
+        addAndMakeVisible (themeBox);
+
+        inBox.addItem (tr ("CABLE In 16ch (VB-Audio Virtual Cable) \xc2\xb7 직접 루프백"), 1);
+        inBox.addItem (tr ("자동 (CABLE In)"), 2);
+        inBox.setSelectedId (1, juce::dontSendNotification);
+        inBox.setTooltip (tr ("플레이어가 소리를 내보내는 장치. Atmos Bridge가 직접 받습니다(루프백). 입력 주기는 Windows가 정함(10 ms)."));
+        addAndMakeVisible (inBox);
+
+        const int bufs[4] = { 96, 144, 240, 480 };
+        for (int k = 0; k < 4; ++k)
+            bufBox.addItem (tr ("버퍼 ") + juce::String (bufs[k]) + tr (" smp \xc2\xb7 ") + juce::String (bufs[k] / 48.0, bufs[k] % 48 == 0 ? 0 : 1) + " ms", bufs[k]);
+        bufBox.addItem (tr ("출력 10 ms (Windows 고정)"), 1);
+        bufBox.setSelectedId (240, juce::dontSendNotification);
+        bufBox.onChange = [this] { if (bufBox.getSelectedId() > 1) bufferSmp = bufBox.getSelectedId(); };
+        bufBox.setTooltip (tr ("2ch 배타 모드의 출력 버퍼 = 출력 지연. 작을수록 빠르지만 끊김 위험. AVR(HDMI) 드라이버가 허용하는 값만 고를 수 있습니다."));
+        addAndMakeVisible (bufBox);
+
+        excl.setTooltip (tr ("2ch Stereo는 배타 모드로만 출력합니다: Windows 믹서와 공간 음향을 거치지 않아야 AVR이 PCM 2.0을 받고 업믹서를 쓸 수 있습니다. "
+                             "출력 중에는 다른 앱 소리가 AVR로 나가지 않습니다."));
+        addAndMakeVisible (excl);
+
+        outBox.addItem (tr ("AVR_x3800h (AMD High Definition Audio Device)"), 1);
+        outBox.setSelectedId (1, juce::dontSendNotification);
+        addAndMakeVisible (outBox);
+
+        routingBtn.setButtonText ("ROUTING");
+        routingBtn.getProperties().set ("bold", true);
+        routingBtn.getProperties().set ("radius", 8.0);
+        routingBtn.setTooltip (tr ("입력 채널 \xe2\x86\x92 처리 채널 연결 (출력 쪽은 번호표)"));
+        routingBtn.onClick = [this] { openRouting(); };
+        addAndMakeVisible (routingBtn);
+
+        seqBtn.onClick = [this] { proc.toggleSequence(); };
+        addAndMakeVisible (seqBtn);
+        stopBtn.setButtonText (tr ("테스트 정지"));
+        stopBtn.onClick = [this] { proc.stopTests(); };
+        addAndMakeVisible (stopBtn);
+
+        master.setSliderStyle (juce::Slider::LinearHorizontal);
+        master.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+        master.setRange (-60.0, 0.0, 0.5);
+        master.setValue (-6.0, juce::dontSendNotification);
+        master.onValueChange = [this] { repaintLive (kHFooter.toNearestInt()); };
+        addAndMakeVisible (master);
+        muteBtn.setButtonText ("MUTE");
+        muteBtn.getProperties().set ("bold", true);
+        muteBtn.onClick = [this] { muted = ! muted; refresh(); };
+        addAndMakeVisible (muteBtn);
+
+        addAndMakeVisible (scanlines);
+        setSize (kHostW, kHostH);
+    }
+
+    ~HostRootView() override { routingWin.reset(); }
+
+    void setStereo (bool s)
+    {
+        if (ctx.stereoOnly == s) return;
+        ctx.stereoOnly = s;
+        if (s) proc.stopTests();
+        room.repaint();
+        map.refresh();
+        map.repaint();
+        right.refresh();
+        if (routingView != nullptr) routingView->repaint();
+        refresh();
+    }
+
+    void themeChanged()
+    {
+        const auto& t = ctx.th();
+        themeBox.setSelectedId ((int) t.id + 1, juce::dontSendNotification);
+        themeBox.setColour (juce::ComboBox::backgroundColourId, t.themeBoxBg);
+        themeBox.setColour (juce::ComboBox::textColourId, t.themeBoxText);
+        themeBox.setColour (juce::ComboBox::outlineColourId, t.themeBoxBorder);
+        themeBox.setColour (juce::ComboBox::arrowColourId, t.themeBoxText);
+        for (auto* cb : { &inBox, &bufBox, &outBox })
+        {
+            cb->setColour (juce::ComboBox::backgroundColourId, t.field);
+            cb->setColour (juce::ComboBox::textColourId, t.text);
+            cb->setColour (juce::ComboBox::outlineColourId, t.btnBorder);
+            cb->setColour (juce::ComboBox::arrowColourId, t.sub);
+        }
+        stylePlain (stopBtn, t);
+        stylePlain (routingBtn, t);
+        setBorder (routingBtn, t.dark ? t.accent.withAlpha (0.7f) : t.btnBorder);
+        master.setColour (juce::Slider::backgroundColourId, t.field);
+        master.setColour (juce::Slider::trackColourId, t.dark ? t.neon.withAlpha (0.8f) : t.accent);
+        master.setColour (juce::Slider::thumbColourId, t.dark ? t.neon : t.accent);
+        excl.repaint();
+        if (routingView != nullptr) { routingView->style(); routingView->repaint(); }
+
+        background.repaint();
+        room.themeChanged();
+        map.themeChanged();
+        right.themeChanged();
+        lastMode = -1;
+        lastStereo = -1;
+        refresh();
+        if (livePainter != nullptr) livePainter->repaint();
+    }
+
+    void resized() override
+    {
+        background.setBounds (getLocalBounds());
+        scanlines.setBounds (getLocalBounds());
+        themeBox.setBounds (520, 34, 170, 32);
+        for (int f = 0; f < 2; ++f) fmtBtn[(size_t) f].setBounds (1158 + f * 155, 35, 153, 30);
+        for (int m = 0; m < kNumModes; ++m) modeBtn[(size_t) m].setBounds (1486 + m * 70, 35, 66, 30);
+        inBox.setBounds (40, 117, 440, 32);
+        bufBox.setBounds (628, 117, 214, 32);
+        excl.setBounds (852, 117, 184, 32);
+        outBox.setBounds (1060, 117, 438, 32);
+        routingBtn.setBounds (1524, 111, 180, 40);
+        room.setBounds (kHRoom);
+        map.setBounds (kHMap);
+        right.setBounds (kHRight);
+        seqBtn.setBounds (40, 816, 136, 36);
+        stopBtn.setBounds (184, 816, 104, 36);
+        master.setBounds (1252, 822, 150, 24);
+        muteBtn.setBounds (1484, 818, 72, 32);
+    }
+
+    void refresh()
+    {
+        const auto& t = ctx.th();
+        map.refresh();
+        right.refresh();
+
+        const int mode = (int) proc.getMode();
+        if (mode != lastMode)
+        {
+            lastMode = mode;
+            for (int m = 0; m < kNumModes; ++m) segment (modeBtn[(size_t) m], m == mode);
+        }
+        const int st = ctx.stereoOnly ? 1 : 0;
+        if (st != lastStereo)
+        {
+            lastStereo = st;
+            segment (fmtBtn[0], ctx.stereoOnly);
+            segment (fmtBtn[1], ! ctx.stereoOnly);
+            bufBox.setSelectedId (ctx.stereoOnly ? bufferSmp : 1, juce::dontSendNotification);
+            bufBox.setEnabled (ctx.stereoOnly);
+            excl.checked = ctx.stereoOnly;
+            excl.setEnabled (ctx.stereoOnly);
+            excl.repaint();
+        }
+
+        const bool seq = proc.isSequenceOn();
+        seqBtn.setButtonText (seq ? tr ("순차 테스트 중지") : tr ("순차 테스트 톤"));
+        seqBtn.setColour (juce::TextButton::buttonColourId, t.btn);
+        seqBtn.setColour (juce::TextButton::textColourOffId, t.text);
+        setBorder (seqBtn, seq ? t.neon : t.btnBorder);
+        seqBtn.repaint();
+        muteBtn.setColour (juce::TextButton::buttonColourId, muted ? t.muteBg : t.btn);
+        muteBtn.setColour (juce::TextButton::textColourOffId, muted ? t.muteFg : t.dim);
+        setBorder (muteBtn, muted ? t.muteBorder : t.btnBorder);
+        muteBtn.repaint();
+
+        updateTexts();
+        repaintLive (kHStatus.expanded (2).toNearestInt());
+        repaintLive (kHRate.expanded (2).toNearestInt());
+        repaintLive (kHFooter.toNearestInt());
+    }
+
+    void paintLive (juce::Graphics& g)
+    {
+        const auto& t = ctx.th();
+        g.setColour (statusColour.withAlpha (t.dark ? 0.10f : 0.12f)); g.fillRoundedRectangle (kHStatus, 16);
+        g.setColour (statusColour.withAlpha (0.45f)); g.drawRoundedRectangle (kHStatus.reduced (0.5f), 16, 1);
+        if (t.dark) { g.setColour (statusColour.withAlpha (0.5f)); g.fillEllipse (kHStatus.getX() + 11, kHStatus.getCentreY() - 6, 12, 12); }
+        g.setColour (statusColour); g.fillEllipse (kHStatus.getX() + 13, kHStatus.getCentreY() - 4, 8, 8);
+        g.setColour (t.text); g.setFont (uiFont (15.5f));
+        g.drawText (statusText, kHStatus.withTrimmedLeft (28).withTrimmedRight (10).toNearestInt(), juce::Justification::centredLeft, true);
+
+        g.setColour (t.pillBg); g.fillRoundedRectangle (kHRate, 8);
+        g.setColour (t.pillBorder); g.drawRoundedRectangle (kHRate.reduced (0.5f), 8, 1);
+        g.setColour (t.text); g.setFont (monoFont (15.0f, true));
+        g.drawText ("48000 Hz", kHRate.toNearestInt(), juce::Justification::centred);
+
+        g.setColour (t.sub); g.setFont (uiFont (15.0f));
+        g.drawText (testText, 298, 816, 220, 36, juce::Justification::centredLeft, true);
+        g.setColour (t.text); g.setFont (uiFont (15.5f, true));
+        g.drawText (latencyHead, 530, 816, 150, 36, juce::Justification::centredLeft, true);
+        g.setColour (t.sub); g.setFont (uiFont (14.5f));
+        g.drawText (latencyText, 664, 816, 430, 36, juce::Justification::centredLeft, true);
+        g.setColour (t.sub); g.setFont (uiFont (15.0f));
+        g.drawText (tr ("끊김 0"), kHDrop.toNearestInt(), juce::Justification::centred);
+
+        g.setColour (t.sub); g.setFont (uiFont (13.0f, true));
+        g.drawText ("MASTER", 1184, 816, 64, 36, juce::Justification::centredLeft);
+        g.setColour (muted ? t.muteFg : t.text); g.setFont (monoFont (14.5f, true));
+        g.drawText (juce::String (master.getValue(), 1) + " dB", 1404, 816, 76, 36, juce::Justification::centred);
+
+        g.setColour (t.ok); g.fillEllipse (1576, 830, 8, 8);
+        g.setColour (t.text); g.setFont (uiFont (15.0f, true));
+        g.drawText (tr ("동작 중"), 1590, 816, 110, 36, juce::Justification::centredLeft);
+    }
+
+    void mouseDown (const juce::MouseEvent&) override {}
+
+    struct LivePainter final : public juce::Component
+    {
+        explicit LivePainter (HostRootView& r) : root (r) { setInterceptsMouseClicks (false, false); }
+        void paint (juce::Graphics& g) override { root.paintLive (g); }
+        HostRootView& root;
+    };
+
+    void addLivePainter()
+    {
+        livePainter = std::make_unique<LivePainter> (*this);
+        addAndMakeVisible (*livePainter);
+        livePainter->toBehind (&room);
+        livePainter->setBounds (getLocalBounds());
+    }
+
+    void repaintLive (juce::Rectangle<int> area) { if (livePainter != nullptr) livePainter->repaint (area); }
+
+    RoutingView* getRoutingView() { return routingView; }
+
+private:
+    void segment (juce::TextButton& b, bool on)
+    {
+        const auto& t = ctx.th();
+        b.setColour (juce::TextButton::buttonColourId, on ? (t.solidActive ? t.accent : t.accent.withAlpha (0.16f)) : juce::Colours::transparentBlack);
+        b.setColour (juce::TextButton::textColourOffId, on ? t.activeText : t.dim);
+        setBorder (b, juce::Colours::transparentBlack);
+        b.repaint();
+    }
+
+    void updateTexts()
+    {
+        const auto& t = ctx.th();
+        if (proc.isBypassed())
+        {
+            statusColour = t.bypBorder;
+            statusText = tr ("BYPASS \xc2\xb7 원본이 플러그인 없이 그대로 나갑니다");
+        }
+        else if (ctx.stereoOnly)
+        {
+            statusColour = t.ok;
+            statusText = tr ("2ch 출력 중 \xc2\xb7 AVR_x3800h \xc2\xb7 배타 \xc2\xb7 PCM 24-bit");
+        }
+        else
+        {
+            statusColour = t.ok;
+            statusText = tr ("출력 중 \xc2\xb7 AVR_x3800h \xc2\xb7 Dolby Atmos for home theater");
+        }
+
+        const int mode = (int) proc.getMode();
+        const double margin = mode == 0 ? 20.0 : mode == 1 ? 4.0 : 3.0;
+        const double out = ctx.stereoOnly ? bufferSmp / 48.0 : 10.0;
+        const double plug = right.pluginLatencyMs();
+        const double total = 10.0 + margin + plug + out;
+        latencyHead = tr ("지연 \xe2\x89\x88 ") + juce::String (total, 1) + " ms";
+        latencyText = tr ("입력 10 + 여유 ") + juce::String (margin, 1) + tr (" + 플러그인 ") + juce::String (plug, 1)
+                    + tr (" + 출력 ") + juce::String (out, 1) + (ctx.stereoOnly ? tr (" (AVR 처리 제외)") : tr (" (Dolby\xc2\xb7" "AVR 제외)"));
+
+        const int seqPos = proc.getSequencePosition();
+        const int pNoise = seqPos >= 0 ? seqPos : proc.getPositionNoise();
+        testText = pNoise >= 0 ? tr ("핑크 노이즈 -20 dBFS \xe2\x86\x92 ") + kPosCodes[(size_t) pNoise] : juce::String();
+    }
+
+    void openRouting()
+    {
+        if (routingWin != nullptr) { routingWin->toFront (true); return; }
+        auto* v = new RoutingView (ctx);
+        v->style();
+        routingView = v;
+        routingWin = std::make_unique<juce::DocumentWindow> ("Routing (Atmos Bridge)", ctx.th().bgTop, juce::DocumentWindow::closeButton);
+        routingWin->setUsingNativeTitleBar (true);
+        routingWin->setContentOwned (v, true);
+        routingWin->centreWithSize (v->getWidth(), v->getHeight());
+        routingWin->setVisible (true);
+    }
+
+    AtmosBridgeProcessor& proc;
+    UiCtx& ctx;
+    HostBackground background;
+    RoomView room;
+    MapPanel map;
+    HostRightPanel right;
+    std::unique_ptr<LivePainter> livePainter;
+    juce::ComboBox themeBox, inBox, bufBox, outBox;
+    ExclusiveCheck excl;
+    std::array<juce::TextButton, kNumModes> modeBtn;
+    std::array<juce::TextButton, 2> fmtBtn;
+    juce::TextButton routingBtn, seqBtn, stopBtn, muteBtn;
+    juce::Slider master;
+    ScanlineOverlay scanlines;
+    std::unique_ptr<juce::DocumentWindow> routingWin;
+    RoutingView* routingView = nullptr;
+    int lastMode = -1, lastStereo = -1, bufferSmp = 240;
+    bool muted = false;
+    juce::Colour statusColour { juce::Colours::grey };
+    juce::String statusText, latencyHead, latencyText, testText;
+};
+
+#if AB_TEST_HOOKS
+juce::Image abtest::renderRouting (int theme, bool stereo)
+{
+    UiCtx ctx;
+    ctx.t = &themeFor ((ThemeId) theme);
+    ctx.stereoOnly = stereo;
+    NeonLookAndFeel lnf;
+    lnf.setTheme (*ctx.t);
+    RoutingView v (ctx);
+    v.setLookAndFeel (&lnf);
+    v.style();
+    v.setBounds (0, 0, RoutingView::kW, RoutingView::kH);
+    auto img = v.createComponentSnapshot (v.getLocalBounds(), true, 1.0f);
+    v.setLookAndFeel (nullptr);
+    return img;
+}
+#endif
+#else
+class HostRootView final : public juce::Component {};   // plugin builds: no host screen
+#endif // AB_HOST_UI
+
 //==============================================================================
 AtmosBridgeEditor::AtmosBridgeEditor (AtmosBridgeProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
@@ -2296,20 +3328,34 @@ AtmosBridgeEditor::AtmosBridgeEditor (AtmosBridgeProcessor& p)
     lnf = std::make_unique<NeonLookAndFeel>();
     setLookAndFeel (lnf.get());
 
-    root = std::make_unique<RootView> (proc, *ctx);
-    root->addLivePainter();
-    addAndMakeVisible (*root);
+   #if AB_HOST_UI && AB_TEST_HOOKS
+    if (const char* hp = std::getenv ("AB_HOST_PREVIEW"))
+    {
+        ctx->stereoOnly = juce::String (hp) == "2ch";
+        hostRoot = std::make_unique<HostRootView> (proc, *ctx);
+        hostRoot->addLivePainter();
+        addAndMakeVisible (*hostRoot);
+        baseW = kHostW;
+        baseH = kHostH;
+    }
+    else
+   #endif
+    {
+        root = std::make_unique<RootView> (proc, *ctx);
+        root->addLivePainter();
+        addAndMakeVisible (*root);
+    }
 
     setResizable (true, true);
     if (auto* c = getConstrainer())
     {
-        c->setFixedAspectRatio ((double) kBaseWidth / (double) kBaseHeight);
-        c->setSizeLimits (kBaseWidth / 2, kBaseHeight / 2, (int) (kBaseWidth * 1.5), (int) (kBaseHeight * 1.5));
+        c->setFixedAspectRatio ((double) baseW / (double) baseH);
+        c->setSizeLimits (baseW / 2, baseH / 2, (int) (baseW * 1.5), (int) (baseH * 1.5));
     }
     shownTheme = proc.getTheme();
     applyTheme();
     const float s = proc.getUiScale();
-    setSize (juce::roundToInt (kBaseWidth * s), juce::roundToInt (kBaseHeight * s));
+    setSize (juce::roundToInt (baseW * s), juce::roundToInt (baseH * s));
     startTimerHz (30);
 }
 
@@ -2317,6 +3363,9 @@ AtmosBridgeEditor::~AtmosBridgeEditor()
 {
     stopTimer();
     root.reset();
+   #if AB_HOST_UI
+    hostRoot.reset();
+   #endif
     setLookAndFeel (nullptr);
 }
 
@@ -2326,6 +3375,9 @@ void AtmosBridgeEditor::applyTheme()
     lnf->setTheme (*ctx->t);
     sendLookAndFeelChange();
     if (root != nullptr) root->themeChanged();
+   #if AB_HOST_UI
+    if (hostRoot != nullptr) hostRoot->themeChanged();
+   #endif
     repaint();
 }
 
@@ -2336,10 +3388,14 @@ void AtmosBridgeEditor::paint (juce::Graphics& g)
 
 void AtmosBridgeEditor::resized()
 {
-    if (root == nullptr) return;
-    const float s = (float) getWidth() / (float) kBaseWidth;
-    root->setTransform (juce::AffineTransform::scale (s));
-    root->setBounds (0, 0, kBaseWidth, kBaseHeight);
+    juce::Component* view = root.get();
+   #if AB_HOST_UI
+    if (hostRoot != nullptr) view = hostRoot.get();
+   #endif
+    if (view == nullptr) return;
+    const float s = (float) getWidth() / (float) baseW;
+    view->setTransform (juce::AffineTransform::scale (s));
+    view->setBounds (0, 0, baseW, baseH);
     proc.setUiScale (s);
 }
 
@@ -2351,4 +3407,7 @@ void AtmosBridgeEditor::timerCallback()
         applyTheme();
     }
     if (root != nullptr) root->refresh();
+   #if AB_HOST_UI
+    if (hostRoot != nullptr) hostRoot->refresh();
+   #endif
 }

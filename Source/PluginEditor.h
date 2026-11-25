@@ -9,11 +9,13 @@ namespace abtest
     void roomManual (bool manual);   // room neon driven by roomTick() instead of its timer
     juce::Component* findRoom (juce::Component* editor);
     void roomTick (juce::Component* editor, double dtSec);
+    juce::Image renderRouting (int theme, bool stereo);   // host app preview: the Routing window
 }
 #endif
 
 class NeonLookAndFeel;
 class RootView;
+class HostRootView;
 struct UiCtx;
 
 //==============================================================================
@@ -38,6 +40,8 @@ private:
     std::unique_ptr<UiCtx> ctx;
     std::unique_ptr<NeonLookAndFeel> lnf;
     std::unique_ptr<RootView> root;
+    std::unique_ptr<HostRootView> hostRoot;   // host app screen (preview)
+    int baseW = ab::kBaseWidth, baseH = ab::kBaseHeight;
     juce::TooltipWindow tooltips { this, 500 };
     ab::ThemeId shownTheme = ab::ThemeId::Cyberpunk;
 
