@@ -77,13 +77,13 @@ void FileLogger::openIfNeeded()
     std::error_code ec;
     const fs::path dir = fs::u8path (getAppDataFolderUtf8()) / "Logs";
     fs::create_directories (dir, ec);
-    const fs::path file = dir / "atmosbridge.log";
+    const fs::path file = dir / (baseName + ".log");
 
     // Keep the log small: rotate at 1 MB.
     if (fs::exists (file, ec) && fs::file_size (file, ec) > 1024 * 1024)
     {
-        fs::remove (dir / "atmosbridge.old.log", ec);
-        fs::rename (file, dir / "atmosbridge.old.log", ec);
+        fs::remove (dir / (baseName + ".old.log"), ec);
+        fs::rename (file, dir / (baseName + ".old.log"), ec);
     }
     stream.open (file, std::ios::out | std::ios::app);
     pathUtf8 = file.u8string();

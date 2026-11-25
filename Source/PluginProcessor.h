@@ -153,6 +153,62 @@ public:
     double getUpmixerLatencyMs() const noexcept;    // latency of the upmixer that is running now
     int getSlotsVersion() const noexcept { return slotsVersion; } // changes whenever the slot list changes
 
+    //========================================================================== host app (Atmos Bridge Host)
+    // The standalone host runs this processor without a plugin host: the input is always the direct loopback
+    // (all three modes), the chain holds stereo plugins and upmixers in any order, the output is Atmos or 2ch Stereo.
+    // The plugin never calls any of this (hostApp stays false and nothing below changes its behaviour).
+    void setHostApp (bool on);                       // before prepareToPlay
+    bool isHostApp() const noexcept { return hostApp; }
+
+    ab::OutputFormat getOutputFormat() const noexcept { return (ab::OutputFormat) outputFormat.load(); }
+    void setOutputFormat (ab::OutputFormat f);
+    int getExclusiveBufferFrames() const noexcept { return exclusiveFrames; }   // 2ch exclusive buffer at 48 kHz
+    void setExclusiveBufferFrames (int frames);
+
+    float getMasterDb() const noexcept { return masterDb.load(); }
+    void setMasterDb (float db);
+    bool isMasterMuted() const noexcept { return masterMute.load(); }
+    void setMasterMuted (bool m);
+
+    // Routing: CABLE In channel i (0..15) -> processing channel p (0..11), per-input gain (dB) and mute.
+    bool isRouted (int in, int p) const noexcept { return ((routeMask[(size_t) p].load() >> in) & 1u) != 0; }
+    void setRouted (int in, int p, bool on);
+    float getInputGainDb (int in) const noexcept { return inGainDb[(size_t) in].load(); }
+    void setInputGainDb (int in, float db);
+    bool isInputMuted (int in) const noexcept { return inMute[(size_t) in].load(); }
+    void setInputMuted (int in, bool m);
+    void setRoutingPreset (int preset);              // 0 = 1:1, 1 = swap 1/2, 2 = mono (1+2 -> 1 and 2), 3 = clear
+    int getRoutingVersion() const noexcept { return routingVersion; }
+
+    // The chain: stereo plugins (2 -> 2) and upmixers (2 -> 12) in one list, processed top to bottom.
+    // Before the running upmixer the chain carries channels 1-2; after it 12 (a stereo plugin there works on 1-2).
+    struct ChainView
+    {
+        bool upmixer = false;
+        juce::String name, path, error;
+        bool loaded = false, bypass = false, active = true;
+        int scope = 0;              // stereo plugins: 0 both formats, 1 2ch only, 2 Atmos only
+        double latencyMs = 0.0;
+        bool afterUpmixer = false;  // stereo plugin after the running upmixer
+        bool idle = false;          // not used in the current output format
+    };
+    int getChainSize() const noexcept { return (int) chain.size(); }
+    ChainView getChainItem (int pos) const;
+    int getChainVersion() const noexcept { return chainVersion + slotsVersion; }
+    bool addStereoPlugin (const juce::String& path, juce::String& error);
+    void removeChainItem (int pos);
+    void moveChainItem (int from, int to);
+    void toggleChainBypass (int pos);
+    void toggleChainActive (int pos);                // upmixers: O / X
+    void cycleChainScope (int pos);                  // stereo plugins: both / 2ch only / Atmos only
+    juce::AudioPluginInstance* getChainInstance (int pos) const noexcept;
+    int getChainWindowKey (int pos) const noexcept;  // stable key per hosted plugin (0..3 upmixers, 4..7 stereo)
+    UpmixerHost& getHostByKey (int key) noexcept     { return key < ab::kMaxUpmixers ? *hosts[(size_t) key] : *fxHosts[(size_t) (key - ab::kMaxUpmixers)]; }
+    double getPluginLatencyMs() const noexcept;      // the chain in the current format
+    double getOutputPeriodMs() const noexcept;       // 2ch: exclusive buffer, Atmos: spatial pass
+    std::function<void()> onStateChanged;            // host app: something worth saving changed (message thread)
+    std::function<void()> onHideToTray;              // host app: the window's tray button
+
     bool isOutputOwner() const noexcept { return ownsOutput.load (std::memory_order_acquire); }
     SharedOutput* getSharedOutput() const noexcept { return isOutputOwner() ? shared.get() : nullptr; }
     double getHostSampleRate() const noexcept { return currentSampleRate; }
@@ -171,6 +227,17 @@ private:
     void processChunk (const float* const* src, int numSrc, int num, float atmosGain0, float atmosGain1);
     void processSource (const float* const* src, int numSrc, int num); // BYPASS ramp + processChunk / silence
     void pushSilence (int num);
+    void routeInputs (int numIn, int num);         // host app: loopback channels -> 12 processing channels
+    void runChain (int num);                       // host app: the chain on inPtrs
+    void rebuildChainSeq();
+    void stateChanged();
+    ab::OutputFeeder::AdaptPolicy wantedPolicy() const noexcept;
+    int findFreeFxHost() const noexcept;
+    int fxIndexForHost (int h) const noexcept;
+    int slotIndexForHost (int h) const noexcept;
+    void unloadAllFx();
+    void writeHostState (juce::ValueTree& s);
+    void readHostState (const juce::ValueTree& s);
 
     // Direct loopback input (Low latency / Ultra low latency+)
     void onDirectPacket (const float* interleaved, int frames, int channels, double lateMs, bool silent);
@@ -242,7 +309,38 @@ private:
     std::atomic<int> activeHost { -1 };
     int slotsVersion = 0;
 
-    struct PendingRestore { bool valid = false; std::vector<SlotEntry> slots; int active = -1; Map direct = defaultMap(); };
+    // Host app: stereo plugins, the chain order (stable host indices) and its audio-thread copy.
+    struct FxEntry
+    {
+        int host = -1;
+        juce::String path, name, pendingState, error;
+        bool bypass = false;
+        int scope = 0;
+    };
+    struct ChainRef { bool upmixer = false; int host = -1; };
+    std::array<std::unique_ptr<UpmixerHost>, ab::kMaxFx> fxHosts;
+    std::vector<FxEntry> fxList;
+    std::vector<ChainRef> chain;
+    static constexpr int kMaxChain = ab::kMaxFx + ab::kMaxUpmixers;
+    std::array<std::atomic<int>, kMaxChain> chainSeq;   // >= 0 stereo host, <= -2 upmixer host (-v - 2), -1 end
+    int chainVersion = 0;
+    juce::AudioBuffer<float> fxWork, routeBuf;
+    std::array<const float*, ab::kNumChannels> routePtrs {};
+
+    bool hostApp = false;
+    std::atomic<int> outputFormat { 0 };
+    int exclusiveFrames = 240;
+    std::atomic<float> masterDb { 0.0f };
+    std::atomic<bool> masterMute { false };
+    float masterNow = 1.0f;
+    std::array<std::atomic<uint32_t>, ab::kNumChannels> routeMask;
+    std::array<std::atomic<float>, ab::kRouteInputs> inGainDb;
+    std::array<std::atomic<bool>, ab::kRouteInputs> inMute;
+    std::array<float, ab::kRouteInputs> inGainNow {};
+    int routingVersion = 0;
+
+    struct PendingFx { std::vector<FxEntry> fx; std::vector<std::pair<bool, int>> order; bool valid = false; };   // order: (upmixer, list index)
+    struct PendingRestore { bool valid = false; std::vector<SlotEntry> slots; int active = -1; Map direct = defaultMap(); PendingFx host; };
     PendingRestore pendingRestore;   // restored state, applied on the message thread
 
     ab::ThemeId theme = ab::ThemeId::Cyberpunk;

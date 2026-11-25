@@ -52,11 +52,13 @@ public:
     //          margin = largest (p + k * period) below the worst lateness, + 1 ms guard
     //      The phase moves only as fast as the two clocks drift apart (tens of ppm); it is tracked
     //      continuously and the margin is raised ahead of time (phases up to 1.5 ms earlier are covered).
-    enum class AdaptPolicy : int { Safe = 0, Fast = 1 };
-    struct PolicyParams { double startMs, addMs, holdS, settleS; bool phaseAware; };
+    //  Stable (host app, Default mode): like Safe with a generous floor (20..60 ms, + 3 ms safety).
+    enum class AdaptPolicy : int { Safe = 0, Fast = 1, Stable = 2 };
+    struct PolicyParams { double startMs, addMs, holdS, settleS; bool phaseAware; double minMs = kAdaptMinMs, maxMs = kAdaptMaxMs; };
     static PolicyParams paramsFor (AdaptPolicy p) noexcept
     {
-        if (p == AdaptPolicy::Fast) return { 15.0, 1.0, 600.0, 120.0, true };
+        if (p == AdaptPolicy::Fast)   return { 15.0, 1.0, 600.0, 120.0, true };
+        if (p == AdaptPolicy::Stable) return { 30.0, 3.0, 600.0, 60.0, false, 20.0, 60.0 };
         return { 15.0, 1.5, 600.0, 120.0, false };
     }
 
@@ -333,7 +335,7 @@ public:
             concealed.fetch_add (1, std::memory_order_relaxed);
             ++concealRun;
             const double shortMs = 1000.0 * (double) (need - avail) / hr;
-            const double m = std::min (kAdaptMaxMs, adaptMarginMs.load() + shortMs + 3.0);
+            const double m = std::min (pp.maxMs, adaptMarginMs.load() + shortMs + 3.0);
             adaptMarginMs.store (m);
             floorMs = m;
             holdUntilUs = nowUs + (int64_t) (pp.holdS * 1e6);
@@ -379,7 +381,7 @@ public:
             // Safe: a packet later than ever seen before raises the margin now (not at the next check).
             if (! pp.phaseAware && ! settling)
             {
-                const double needNow = std::min (kAdaptMaxMs, getMaxJitterMs() + pp.addMs);
+                const double needNow = std::min (pp.maxMs, std::max (pp.minMs, getMaxJitterMs() + pp.addMs));
                 if (needNow > adaptMarginMs.load())
                 {
                     adaptMarginMs.store (needNow);
@@ -392,7 +394,7 @@ public:
             const double slackMs = 1000.0 * (double) (avail - need) / hr;
             if (slackMs < kNearMissMs)
             {
-                const double m = std::min (kAdaptMaxMs, adaptMarginMs.load() + 1.0);
+                const double m = std::min (pp.maxMs, adaptMarginMs.load() + 1.0);
                 adaptMarginMs.store (m);
                 floorMs = std::max (floorMs, m - 1.0);
                 holdUntilUs = std::max (holdUntilUs, nowUs + (int64_t) (pp.holdS * 1e6));
@@ -412,7 +414,7 @@ public:
                 if (! settling && winN % 10 == 0)     // every ~100 ms
                 {
                     const double j = getMaxJitterMs() + 0.25;
-                    const double needMs = std::clamp (std::max (kAdaptMinMs, phaseMarginMs (j, pm, periodMs, pp.addMs, 1.5)), kAdaptMinMs, kAdaptMaxMs);
+                    const double needMs = std::clamp (std::max (pp.minMs, phaseMarginMs (j, pm, periodMs, pp.addMs, 1.5)), pp.minMs, pp.maxMs);
                     adaptMarginMs.store (std::max (needMs, floorMs > needMs && nowUs <= holdUntilUs ? floorMs : needMs));
                 }
             }
@@ -424,13 +426,13 @@ public:
             {
                 if (pp.phaseAware)
                 {
-                    if (nowUs > holdUntilUs) floorMs = kAdaptMinMs;
+                    if (nowUs > holdUntilUs) floorMs = pp.minMs;
                 }
                 else
                 {
-                    const double needMs = std::clamp (getMaxJitterMs() + pp.addMs, kAdaptMinMs, kAdaptMaxMs);
+                    const double needMs = std::clamp (getMaxJitterMs() + pp.addMs, pp.minMs, pp.maxMs);
                     if (nowUs > holdUntilUs) floorMs = needMs;
-                    adaptMarginMs.store (std::clamp (std::max (floorMs, needMs), kAdaptMinMs, kAdaptMaxMs));
+                    adaptMarginMs.store (std::clamp (std::max (floorMs, needMs), pp.minMs, pp.maxMs));
                 }
                 winN = 0;
             }

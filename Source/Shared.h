@@ -26,6 +26,11 @@ constexpr int kNumModes = 3;
 constexpr float kLimiterCeilingDb = -1.0f; // clipping prevention ceiling (12 channels linked)
 constexpr int kMaxUpmixers = 4;            // upmixer slots
 
+// Host app (Atmos Bridge Host): output format, stereo plugins in the chain, routing matrix inputs
+enum class OutputFormat : int { Atmos = 0, Stereo = 1 };
+constexpr int kMaxFx = 4;                  // stereo plugins in the host chain (plus up to 4 upmixers)
+constexpr int kRouteInputs = 16;           // CABLE In channels in the routing matrix
+
 // Theme presets (index stored in the project and, as "last chosen", for the whole PC user)
 enum class ThemeId : int { Cyberpunk = 0, WhiteModern = 1, CoolBeaches = 2 };
 constexpr int kNumThemes = 3;
@@ -33,4 +38,5 @@ constexpr int kNumThemes = 3;
 // Editor base size (everything is drawn in these coordinates and scaled).
 constexpr int kBaseWidth  = 1740;
 constexpr int kBaseHeight = 812;
+constexpr int kHostBaseHeight = 884;       // host app window (same width)
 } // namespace ab

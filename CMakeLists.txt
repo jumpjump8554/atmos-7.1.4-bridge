@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.22)
 
-project (AtmosBridge VERSION 1.4.1 LANGUAGES C CXX)
+project (AtmosBridge VERSION 2.0.0 LANGUAGES C CXX)
 
 set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -33,13 +33,16 @@ juce_add_plugin (AtmosBridge
 
 juce_generate_juce_header (AtmosBridge)
 
-target_sources (AtmosBridge PRIVATE
+set (AB_SHARED_SOURCES
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
     Source/UpmixerHost.cpp
     Source/engine/SpatialEngine.cpp
+    Source/engine/SpatialFormat.cpp
     Source/engine/LoopbackCapture.cpp
     Source/engine/Platform.cpp)
+
+target_sources (AtmosBridge PRIVATE ${AB_SHARED_SOURCES})
 
 target_include_directories (AtmosBridge PRIVATE Source)
 
@@ -61,9 +64,54 @@ target_link_libraries (AtmosBridge
         juce::juce_recommended_warning_flags)
 
 if (WIN32)
-    target_link_libraries (AtmosBridge PRIVATE ole32 avrt shell32 uuid)
+    target_link_libraries (AtmosBridge PRIVATE ole32 avrt shell32 uuid runtimeobject)
 endif()
 
 if (MSVC)
     target_compile_options (AtmosBridge PRIVATE /utf-8)
+endif()
+
+#==============================================================================
+# Atmos Bridge Host: the same engine as a standalone Windows app (no plugin host needed),
+# with the plugin chain, 2ch Stereo output, routing and the tray.
+juce_add_gui_app (AtmosBridgeHost
+    PRODUCT_NAME    "Atmos Bridge Host"
+    COMPANY_NAME    "Atmos Bridge"
+    VERSION         ${PROJECT_VERSION}
+    ICON_BIG        "${CMAKE_CURRENT_SOURCE_DIR}/resources/AppIcon.png"
+    ICON_SMALL      "${CMAKE_CURRENT_SOURCE_DIR}/resources/AppIcon.png")
+
+juce_generate_juce_header (AtmosBridgeHost)
+
+target_sources (AtmosBridgeHost PRIVATE Source/HostApp.cpp ${AB_SHARED_SOURCES})
+target_include_directories (AtmosBridgeHost PRIVATE Source)
+
+target_compile_definitions (AtmosBridgeHost PRIVATE
+    DONT_SET_USING_JUCE_NAMESPACE=1
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_PLUGINHOST_VST3=1
+    AB_HOST_UI=1
+    "JucePlugin_Name=\"Atmos Bridge 7.1.4ch\""
+    "JucePlugin_VersionString=\"${PROJECT_VERSION}\""
+    JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:AtmosBridgeHost,JUCE_PRODUCT_NAME>"
+    JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:AtmosBridgeHost,JUCE_VERSION>")
+
+target_link_libraries (AtmosBridgeHost
+    PRIVATE
+        juce::juce_audio_utils
+        juce::juce_audio_processors
+        juce::juce_gui_extra
+        juce::juce_gui_basics
+    PUBLIC
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_lto_flags
+        juce::juce_recommended_warning_flags)
+
+if (WIN32)
+    target_link_libraries (AtmosBridgeHost PRIVATE ole32 avrt shell32 uuid runtimeobject)
+endif()
+
+if (MSVC)
+    target_compile_options (AtmosBridgeHost PRIVATE /utf-8)
 endif()

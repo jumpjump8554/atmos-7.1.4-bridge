@@ -1,5 +1,71 @@
 # Atmos Bridge 7.1.4ch
 
+**v2.0부터 두 가지로 받을 수 있습니다.**
+
+| 다운로드 | 무엇 |
+|---|---|
+| `Atmos-Bridge-Host-win64.zip` | **Atmos Bridge Host** — 호스트 없이 혼자 실행되는 프로그램 (아래 "0. Atmos Bridge Host") |
+| `Atmos-Bridge-7.1.4ch-VST3-win64.zip` | **VST3 플러그인** — 지금까지처럼 MultiChannel Plugin Host 안에서 사용 (1장부터) |
+
+---
+
+## 0. Atmos Bridge Host (v2.0)
+
+```
+플레이어 → CABLE In (VB-Audio) → [Atmos Bridge Host: 직접 루프백 → 라우팅 → 플러그인 체인]
+  → Atmos 7.1.4:  Windows 공간 음향 (Dolby Atmos for home theater, MAT) → AVR
+  → 2ch Stereo:   WASAPI 배타 모드 PCM 2.0 → AVR 업믹서 (Dolby Surround · Auro-3D · Neural:X)
+```
+
+**설치** — `Atmos-Bridge-Host-win64.zip`을 풀어 아무 폴더(예: `C:\Atmos Bridge Host`)에 두고 `Atmos Bridge Host.exe`를 실행합니다. 설치 과정은 없습니다.
+MultiChannel Plugin Host는 **끄세요**(같은 AVR을 두 프로그램이 쓰면 2ch 배타 모드가 열리지 않고, 두 번 출력될 수 있습니다).
+
+**화면** — 플러그인과 같은 스피커 배치 · 채널 매핑(번호표) · 테마에 호스트 기능이 더해졌습니다.
+
+| 위치 | 기능 |
+|---|---|
+| 상단 | 상태 · **출력 형식 [2ch Stereo \| Atmos 7.1.4]** · 모드 [기본 \| 저지연 \| 초저지연+] |
+| INPUT | 플레이어가 소리를 내보내는 장치 (자동 = CABLE In 16ch, 없으면 CABLE In). 직접 루프백으로 받습니다 |
+| ENGINE | 48000 Hz · **Buffer** (2ch: 96 / 144 / 240 / 480 smp = 2 / 3 / 5 / 10 ms, Atmos: 10 ms 고정) · **Exclusive** (2ch: 항상 켜짐, Atmos: 사용 불가) |
+| OUTPUT | AVR (자동 = AVR/HDMI 우선) |
+| ROUTING | 입력 16채널 → 처리 12채널 매트릭스, 입력별 레벨 · 뮤트, 두 번째 탭은 번호표(처리 → 스피커) |
+| ⤓ | 트레이로 숨기기 |
+| 플러그인 체인 | 스테레오 플러그인(최대 4)과 업믹서(최대 4)를 **한 목록**에 넣고 ≡ 를 끌어 순서 변경 |
+| 아래 | 순차 테스트 톤 · 지연(입력 + 여유 + 플러그인 + 출력) · 끊김 · **MASTER** 볼륨 · MUTE · 동작 상태 |
+
+**플러그인 체인**
+- **+ 플러그인 추가** → "스테레오 플러그인 (2 → 2)" 또는 "업믹서 (2 → 12ch)"에서 고릅니다. 추가하면 설정 창이 열리고, 이름을 누르면 다시 열립니다.
+- 위에서부터 순서대로 처리합니다. **업믹서 앞은 2채널(CH 1-2), 뒤는 12채널**이고, 업믹서 뒤에 둔 스테레오 플러그인은 CH 1-2(L/R)에 적용됩니다.
+- 스테레오 플러그인마다 **[2ch · Atmos / 2ch만 / Atmos만]** — zBACCH 같은 XTC는 "2ch만"으로 두면 Atmos에서 자동으로 쉽니다.
+- 업믹서는 **O/X**(켜진 업믹서는 하나), 모든 줄에 **B**(바이패스) · **D**(삭제). 업믹서는 2ch Stereo에서 쉽니다(업믹스는 AVR이).
+- 체인과 각 플러그인의 설정, 라우팅, 번호표, 출력 형식, 모드, 볼륨은 바뀔 때마다 자동 저장되어 다음 실행 때 그대로 열립니다
+  (`%APPDATA%\Atmos Bridge Host\host-state.dat`).
+
+**2ch Stereo**
+- PCM 2.0(48 kHz 24-bit 우선)을 **배타 모드**로 AVR에 보냅니다. Windows 믹서와 공간 음향을 거치지 않으므로 AVR이 PCM을 받고 업믹서를 쓸 수 있습니다.
+- AVR 장치 속성 → 고급 → **"응용 프로그램이 이 장치를 단독으로 제어하도록 허용"**이 켜져 있어야 합니다 (꺼져 있으면 상태에 "배타 모드 꺼짐").
+- 출력하는 동안 다른 앱(알림음 등)은 AVR로 소리를 낼 수 없습니다. 다른 앱이 AVR을 쓰고 있으면 상태에 "AVR을 다른 앱이 사용 중".
+- Buffer를 줄이면 지연이 줄지만 끊김 위험이 커집니다 (AVR 드라이버의 최소 주기보다 작게는 열리지 않습니다). 240 smp(5 ms)에서 시작하세요.
+- XTC(zBACCH 등)를 쓸 때는 AVR을 **Stereo**(또는 Direct) 모드로 두세요.
+
+**Atmos 7.1.4**
+- 지금까지와 같은 공간 음향 출력입니다. AVR에 공간 음향이 꺼져 있으면 **"Dolby Atmos for home theater"를 자동으로 켜 봅니다**(Windows가 거부하면 소리 설정에서 직접 선택).
+
+**모드** — Host에서는 세 모드 모두 직접 루프백을 씁니다(호스트 입력이 없으므로). 기본 = 여유 20 ms 이상(가장 안정적), 저지연 = 자동 보정, 초저지연+ = 타이밍 맞춤. 처음 실행은 **저지연**.
+
+**트레이**
+- ⤓ 버튼, 최소화, 닫기(X)로 트레이에 숨습니다. **소리는 계속 나갑니다.** 아이콘 클릭 = 창 열기.
+- 아이콘 점 색: 초록 출력 중 · 노랑 연결 중/BYPASS · 빨강 오류 · 회색 정지/MUTE. 마우스를 올리면 형식과 지연.
+- 오른쪽 클릭 메뉴: 창 열기 · 출력 형식 · 모드 · BYPASS · MUTE · **최소화하면 트레이로 / 닫기(X)도 트레이로 / Windows 시작 시 트레이로 자동 실행** · **종료**.
+  처음에는 최소화·닫기 → 트레이가 켜져 있고, 자동 실행은 꺼져 있습니다. 프로그램을 끝내려면 트레이 메뉴의 **종료**.
+- 한 번만 실행됩니다 (다시 실행하면 열려 있는 창이 앞으로 나옵니다).
+
+**로그** — `다운로드\AtmosBridge\Logs\atmosbridge-host.log`
+
+---
+
+## VST3 플러그인
+
 업믹서가 만든 **12채널(7.1.4)** 신호를 Windows 공간 음향 API(**ISpatialAudioClient**)로 넘겨,
 Windows의 **Dolby Atmos for home theater** 인코더가 **Dolby MAT**로 HDMI → TV eARC → AV 리시버에 보내도록 하는 **VST3 플러그인**입니다.
 HDMI LPCM의 8채널 한계를 넘어 7.1.4 12채널을 리시버가 Dolby Atmos로 받습니다.
@@ -194,7 +260,9 @@ cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-결과물: `build\AtmosBridge_artefacts\Release\VST3\Atmos Bridge 7.1.4ch.vst3` (JUCE 8.0.15는 CMake가 자동으로 내려받습니다)
+결과물 (JUCE 8.0.15는 CMake가 자동으로 내려받습니다):
+- `build\AtmosBridge_artefacts\Release\VST3\Atmos Bridge 7.1.4ch.vst3` (플러그인)
+- `build\AtmosBridgeHost_artefacts\Release\Atmos Bridge Host.exe` (Host 앱)
 
 DSP 단위 테스트: `g++ -std=c++17 -O2 -I Source tests/test_dsp.cpp -o test_dsp && ./test_dsp`
 

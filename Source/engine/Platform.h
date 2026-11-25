@@ -21,6 +21,7 @@ public:
 
     void log (const std::string& message);
     std::string getPathUtf8() const { return pathUtf8; }
+    void setBaseName (const std::string& name) { std::lock_guard<std::mutex> g (lock); if (! opened) baseName = name; }   // before the first line
 
 private:
     FileLogger();
@@ -28,7 +29,7 @@ private:
 
     std::mutex lock;
     std::ofstream stream;
-    std::string pathUtf8;
+    std::string pathUtf8, baseName { "atmosbridge" };
     bool opened = false;
 };
 
