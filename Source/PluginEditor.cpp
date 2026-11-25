@@ -1172,17 +1172,10 @@ public:
             addAndMakeVisible (mb);
         }
 
-        orderBox.addItem ("Windows", 1);
-        orderBox.addItem ("Dolby", 2);
-        orderBox.addItem ("Auro-3D", 3);
-        orderBox.setTextWhenNothingSelected (tr ("사용자 지정"));
-        orderBox.setTooltip (tr ("입력 채널 순서 (번호표를 그 순서에 맞게 한 번에 설정)\n"
-                                 "Windows: L R C LFE SBL SBR SL SR TFL TFR TRL TRR (기본, 다채널 소스는 이 순서로 들어옴)\n"
-                                 "Dolby: L R C LFE Lss Rss Lrs Rrs Ltf Rtf Ltb Rtb (사이드가 리어보다 먼저)\n"
-                                 "Auro-3D 11.1 (7.1+4H): L R C LFE Lb Rb Ls Rs HL HR HLs HRs (Windows와 같은 순서)\n"
-                                 "업믹서가 '채널 순서 자동'이면 Windows로 두세요."));
-        orderBox.onChange = [this] { if (const int id = orderBox.getSelectedId(); id > 0) proc.applyMapPreset (id - 1); };
-        addAndMakeVisible (orderBox);
+        resetBtn.setButtonText (tr ("기본값"));
+        resetBtn.setTooltip (tr ("지금 쓰는 번호표를 기본 순서(1~12)로 되돌립니다"));
+        resetBtn.onClick = [this] { proc.resetMapping(); };
+        addAndMakeVisible (resetBtn);
 
         allMuteBtn.onClick = [this] { proc.setAllMuted (! proc.areAllMuted()); };
         addAndMakeVisible (allMuteBtn);
@@ -1190,7 +1183,7 @@ public:
 
     void resized() override
     {
-        orderBox.setBounds (206, 18, 112, 30);
+        resetBtn.setBounds (254, 18, 64, 30);
         allMuteBtn.setBounds (326, 18, 96, 30);
         for (int i = 0; i < kNumChannels; ++i)
         {
@@ -1227,16 +1220,6 @@ public:
             setBorder (mb, muted ? t.muteBorder : t.btnBorder);
         }
 
-        if (! orderBox.isPopupActive())
-        {
-            const int preset = proc.getMapPreset();
-            if (orderBox.getSelectedId() != preset + 1)
-            {
-                if (preset >= 0) orderBox.setSelectedId (preset + 1, juce::dontSendNotification);
-                else             orderBox.setSelectedId (0, juce::dontSendNotification);
-            }
-        }
-
         const bool all = proc.areAllMuted();
         allMuteBtn.setButtonText (all ? "All Unmute" : "All Mute");
         allMuteBtn.setColour (juce::TextButton::buttonColourId, all ? t.muteBg : t.btn);
@@ -1255,10 +1238,7 @@ public:
             cb.setColour (juce::ComboBox::backgroundColourId, t.field);
             cb.setColour (juce::ComboBox::textColourId, t.text);
         }
-        orderBox.setColour (juce::ComboBox::backgroundColourId, t.field);
-        orderBox.setColour (juce::ComboBox::textColourId, t.text);
-        orderBox.setColour (juce::ComboBox::outlineColourId, t.btnBorder);
-        orderBox.setColour (juce::ComboBox::arrowColourId, t.sub);
+        stylePlain (resetBtn, t);
         for (auto& nb : noiseBtn) nb->repaint();
         refresh();
     }
@@ -1362,8 +1342,7 @@ private:
     std::array<juce::ComboBox, kNumChannels> numBox;
     std::array<std::unique_ptr<NoiseButton>, kNumChannels> noiseBtn;
     std::array<juce::TextButton, kNumChannels> muteBtn;
-    juce::ComboBox orderBox;
-    juce::TextButton allMuteBtn;
+    juce::TextButton resetBtn, allMuteBtn;
     std::array<float, kNumChannels> rms {};
 };
 
@@ -4031,8 +4010,12 @@ void AtmosBridgeEditor::resized()
     if (hostRoot != nullptr) view = hostRoot.get();
    #endif
     if (view == nullptr) return;
-    const float s = (float) getWidth() / (float) baseW;
-    view->setTransform (juce::AffineTransform::scale (s));
+    // Whole view always visible: the smaller of the two scales, centred (bands of the page colour if the
+    // window's shape differs, never a cut-off edge).
+    const float s = juce::jmin ((float) getWidth() / (float) baseW, (float) getHeight() / (float) baseH);
+    const float dx = 0.5f * ((float) getWidth() - s * (float) baseW);
+    const float dy = 0.5f * ((float) getHeight() - s * (float) baseH);
+    view->setTransform (juce::AffineTransform::scale (s).translated (dx, dy));
     view->setBounds (0, 0, baseW, baseH);
     proc.setUiScale (s);
 }

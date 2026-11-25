@@ -94,9 +94,22 @@ public:
         ed->setResizable (false, false);       // the window does the resizing (the editor scales to its width)
         setContentOwned (ed, true);
         setResizable (true, false);
-        setResizeLimits (kBaseWidth / 2, kHostBaseHeight / 2, (int) (kBaseWidth * 1.5), (int) (kHostBaseHeight * 1.5));
-        if (auto* c = getConstrainer()) c->setFixedAspectRatio ((double) kBaseWidth / (double) kHostBaseHeight);
-        centreWithSize (getWidth(), getHeight());
+        setResizeLimits (kBaseWidth / 3, kHostBaseHeight / 3, 8000, 8000);
+
+        // First size: within the usable screen area (Windows scaling 125-150 %, taskbar), title bar included.
+        int w = getWidth(), h = getHeight();
+        if (const auto* d = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay())
+        {
+            const auto area = d->userArea.reduced (16);
+            const int titleBar = 40;
+            const float k = juce::jmin (1.0f, (float) area.getWidth() / (float) w, (float) (area.getHeight() - titleBar) / (float) h);
+            if (k < 1.0f)
+            {
+                w = juce::roundToInt ((float) w * k);
+                h = juce::roundToInt ((float) h * k);
+            }
+        }
+        centreWithSize (w, h);
     }
 
     void closeButtonPressed() override { if (closeFn) closeFn(); }
